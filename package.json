@@ -1,0 +1,1 @@
+{"name":"squeek-hatchery","version":"0.1.0","private":true,"type":"module","scripts":{"dev":"node scripts/dev.mjs","build":"node scripts/build.mjs","test":"node --test tests/*.test.mjs","compile":"node scripts/compile.mjs"},"dependencies":{"@openzeppelin/contracts":"5.4.0","ethers":"6.15.0"},"devDependencies":{"vite":"6.1.0","solc":"0.8.30","ganache":"7.9.2"}}

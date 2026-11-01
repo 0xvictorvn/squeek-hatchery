@@ -1,0 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import solc from 'solc';
+export function compile(){const result=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',sources:{'SqueekHatchery.sol':{content:fs.readFileSync('contracts/SqueekHatchery.sol','utf8')}},settings:{optimizer:{enabled:true,runs:200},evmVersion:'shanghai',outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}}),{import(p){try{return {contents:fs.readFileSync(path.join('node_modules',p),'utf8')};}catch{return {error:'Import not found: '+p};}}}));const errors=result.errors?.filter(x=>x.severity==='error');if(errors?.length)throw Error(errors.map(x=>x.formattedMessage).join('\n'));return result.contracts['SqueekHatchery.sol'].SqueekHatchery;}
+if(process.argv[1]?.endsWith('compile.mjs')){const c=compile();fs.mkdirSync('artifacts',{recursive:true});fs.writeFileSync('artifacts/SqueekHatchery.json',JSON.stringify(c,null,2));console.log(`Compiled SqueekHatchery: ${c.evm.bytecode.object.length/2} bytes`);}

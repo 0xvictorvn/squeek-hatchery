@@ -1,0 +1,9 @@
+node_modules/
+dist/
+artifacts/
+.env*
+!.env.example
+
+# Local planning documents; excluded from source publication
+IMD-HANDOFF.txt
+GITHUB-SETUP.md
