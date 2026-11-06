@@ -1,3 +1,58 @@
+# Squeek Hatchery — LED Cyber-Laboratory
+
+An English-language community character demo powered by live Squeekchain hardware telemetry. Illuminate an egg for 60 seconds, direct growth across three anatomical regions, and reveal a canonical LED hamster portrait. Guests play in browser memory; verified Ethereum wallets can save results and compete on the weekly leaderboard.
+
+**The current application is in [`squeek-hatchery-demo/`](squeek-hatchery-demo/).** The earlier root-level JavaScript prototype is retained for history and reference. Run the commands below inside the current application folder.
+
+## Run locally
+
+Use Node.js 24 or newer. Clone the entire repository so the sibling runtime art folder is present:
+
+```sh
+cd squeek-hatchery-demo
+npm ci
+npm run dev
+```
+
+Open the local URL printed by Vite. The development server includes the SQLite API and runtime artwork.
+
+## Production
+
+```sh
+cd squeek-hatchery-demo
+npm ci
+npm run build
+node --experimental-strip-types src/server.ts
+```
+
+The Node server serves `dist/`, `/api/*`, and `/lab-assets/*`. It defaults to `127.0.0.1:4173`. Set `HOST` and `PORT` as needed; put an HTTPS reverse proxy in front of it for public use. Set `SQUEEK_DB_PATH` to a persistent path outside deployment releases. The default database path is `cache/hatchery-backend.sqlite`.
+
+Canvas/browser security features and wallet sign-in require a secure browser context: use localhost for development and HTTPS for a public deployment. Publishing this repository does not update the separately deployed VPS.
+
+## Included features
+
+- Three hamster species with independent Head / Middle / Lower growth, Lv0–10.
+- Ten coat palettes, ten cyber accessories, and ten LED backgrounds.
+- Hardware freshness validation, shared telemetry polling, server-authoritative ranked sessions, and restart recovery.
+- SIWE wallet authentication, optional display names, a weekly Top 100, and public result links.
+- 1600×1600 PNG and JSON exports; guest/demo progress remains ephemeral.
+- Experimental, versioned scoring policies. The source is authoritative for current calibration and game rules.
+
+The current character demo uses wallets for authentication and ranked persistence. NFT minting is deferred; contract deployment fields remain null, and the included Solidity contracts are test/reference source.
+
+## Source layout and validation
+
+- `squeek-hatchery-demo/`: current TypeScript/Vite frontend, Node/SQLite API, tests, and contract/reference artifacts.
+- `hamster-trait-lab/assets/`: required runtime character atlases and LED backgrounds, kept alongside the application to match its asset mounts.
+- Original root-level files: previous browser-local prototype.
+
+`npm run build` includes TypeScript checking. `npm test` runs the application test files; browser tests need their documented local browser runtime. See the current application's README for the portable non-browser test command and asset details.
+
+The LED demo builds on [the upstream v0.2.0 source](https://github.com/identity-md-launches/launch-2854-build-squeek-hatchery-company) pinned in `squeek-hatchery-demo/UPSTREAM.json`. Third-party notices are retained under `squeek-hatchery-demo/artifacts/`.
+
+<details>
+<summary>Original prototype documentation</summary>
+
 # Squeek Hatchery
 
 An English-language, unofficial Squeekchain incubation prototype. A real hamster powers a movable lamp; drag the lamp vertically to allocate growth to ears, fur or a short pom tail. The egg stays still and the lamp aims along the local surface normal. Incubate for 60 seconds of valid, visible play, name your creature, save it locally or export SVG/JSON.
@@ -38,3 +93,5 @@ No contract has been deployed and no transaction has been sent by this prototype
 This is an editable community prototype. Artwork, lighting and balance remain open to refinement. See VALIDATION.md for completed checks and remaining verification. All UI and documentation are in English.
 
 Collection records are saved only in the current browser. SVG and JSON downloads are portable backups. The prototype supports the latest 30 local companions. No user tracking or backend.
+
+</details>

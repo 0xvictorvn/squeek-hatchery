@@ -1,0 +1,27 @@
+{
+  "name": "squeek-hatchery",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "contract:build": "forge build",
+    "contract:test": "forge build && node --experimental-strip-types --test tests/contract.chain.ts"
+  },
+  "dependencies": {
+    "@coinbase/wallet-sdk": "^4.4.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@wagmi/connectors": "^8.2.2",
+    "@wagmi/core": "^3.6.7",
+    "viem": "^2.57.14"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

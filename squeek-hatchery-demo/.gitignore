@@ -1,0 +1,29 @@
+node_modules/
+out/
+cache/
+broadcast/
+.env*
+!.env.example
+test/scratch/
+
+# Required test-contract/documentation deliverables. Explicit budget: 786432 bytes
+# across this exact allowlist; see artifacts/PATH-BUDGET.md. No dependency/cache paths.
+!artifacts/
+artifacts/*
+!artifacts/PATH-BUDGET.md
+!artifacts/DEPLOYMENT.md
+!artifacts/PROOF-PROTOCOL.md
+!artifacts/validation.md
+!artifacts/DESIGN-GUIDANCE-LICENSE.txt
+!artifacts/OPENZEPPELIN-LICENSE.txt
+!artifacts/WALLET-ICONS-LICENSE.txt
+!artifacts/contracts/
+artifacts/contracts/*
+!artifacts/contracts/SqueekHatchery.json
+!artifacts/contracts/ERC1967Proxy.json
+!artifacts/contracts/IHatchVerifier.json
+!artifacts/contracts/MockHatchVerifier.json
+!artifacts/contracts/HatcheryV2.json
+!artifacts/contracts/ReceiverProbe.json
+!artifacts/contracts/compiler.json
+!artifacts/contracts/standard-input.json

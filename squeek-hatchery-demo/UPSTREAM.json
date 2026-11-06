@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/identity-md-launches/launch-2854-build-squeek-hatchery-company",
+  "commit": "85f5048884ad9af0c878e17ec109d4c0743fe46e",
+  "purpose": "Integrated LED Cyber-Laboratory character demo, backend authority, and regression-tested recovery; NFT minting deferred.",
+  "copiedFrom": "Committed Git tree, excluding stale dist; reference checkout and existing worktree changes are preserved."
+}

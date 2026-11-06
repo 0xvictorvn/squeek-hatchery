@@ -1,9 +1,23 @@
 node_modules/
 dist/
-artifacts/
+/artifacts/
 .env*
 !.env.example
 
 # Local planning documents; excluded from source publication
 IMD-HANDOFF.txt
 GITHUB-SETUP.md
+
+# LED demo generated files and private runtime data
+**/cache/
+**/dist/
+**/out/
+**/broadcast/
+**/node_modules/
+**/.cursor/
+*.sqlite*
+*.db
+*.db-*
+*.pem
+*.key
+*.p12

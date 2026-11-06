@@ -1,0 +1,10 @@
+{
+  "version": "0.8.30+commit.73712a01.Emscripten.clang",
+  "optimizer": {
+    "enabled": true,
+    "runs": 200
+  },
+  "evmVersion": "prague",
+  "viaIR": false,
+  "openzeppelin": "5.4.0"
+}

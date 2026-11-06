@@ -1,0 +1,1565 @@
+:root {
+  color-scheme: dark;
+  --bg-deep: #070a12;
+  --bg-panel: #0f1524;
+  --bg-card: #131b2e;
+  --bg-elevated: #19233b;
+  --border-subtle: rgba(140, 175, 235, 0.16);
+  --border-bright: rgba(114, 241, 224, 0.45);
+  --text-main: #f3f7ff;
+  --text-muted: #9fb0cf;
+  --accent-cyan: #67e8f9;
+  --accent-mint: #6ee7b7;
+  --accent-violet: #c084fc;
+  --accent-amber: #fbbf24;
+  --accent-danger: #fb7185;
+  --radius-lg: 16px;
+  --radius-md: 11px;
+  --radius-sm: 8px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100vh;
+  overflow-x: hidden;
+  background: radial-gradient(circle at 20% 0%, #16223d 0%, var(--bg-deep) 65%);
+  color: var(--text-main);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent-cyan);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 0.12rem 0.35rem;
+  border-radius: 5px;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.led-shell {
+  width: 100%;
+  max-width: 1380px;
+  margin: 0 auto;
+  padding: 0.85rem 1rem 2.5rem;
+  overflow-x: hidden;
+}
+
+/* ---------- Top Navigation Bar ---------- */
+.led-topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: rgba(15, 21, 36, 0.9);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  backdrop-filter: blur(10px);
+  margin-bottom: 1rem;
+}
+
+.led-brand-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.led-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--text-main);
+  text-decoration: none;
+}
+
+.led-brand-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-mint), var(--accent-cyan));
+  box-shadow: 0 0 10px var(--accent-cyan);
+}
+
+.led-exp-pill {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.14);
+  color: var(--accent-amber);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+
+.led-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.led-nav-link {
+  padding: 0.4rem 0.8rem;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.9rem;
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+
+.led-nav-link:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.05);
+  text-decoration: none;
+}
+
+.led-nav-link.active {
+  color: var(--bg-deep);
+  background: linear-gradient(135deg, var(--accent-mint), var(--accent-cyan));
+  font-weight: 700;
+}
+
+.led-auth-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.led-auth-status {
+  font-size: 0.82rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.led-auth-verified {
+  border-color: rgba(110, 231, 183, 0.45);
+  background: rgba(110, 231, 183, 0.12);
+  color: var(--accent-mint);
+}
+
+.led-auth-unverified {
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.12);
+  color: var(--accent-amber);
+}
+
+/* ---------- Buttons ---------- */
+.led-btn-primary,
+.led-btn-secondary,
+.led-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: 0.88rem;
+  cursor: pointer;
+  border: 1px solid transparent;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.led-btn-primary {
+  background: linear-gradient(135deg, var(--accent-mint), var(--accent-cyan));
+  color: #06101e;
+  font-weight: 700;
+}
+
+.led-btn-primary:hover {
+  filter: brightness(1.06);
+  text-decoration: none;
+}
+
+.led-btn-secondary {
+  background: var(--bg-elevated);
+  color: var(--text-main);
+  border-color: var(--border-bright);
+}
+
+.led-btn-secondary:hover {
+  background: rgba(103, 232, 249, 0.14);
+  text-decoration: none;
+}
+
+.led-btn-ghost {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+  border-color: var(--border-subtle);
+}
+
+.led-btn-ghost:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.1);
+  text-decoration: none;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ---------- Toast Banner ---------- */
+.led-toast {
+  margin-bottom: 1rem;
+  padding: 0.65rem 1rem;
+  border-radius: var(--radius-md);
+  font-size: 0.9rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+}
+
+.led-toast-ok {
+  border-color: rgba(110, 231, 183, 0.5);
+  background: rgba(16, 54, 46, 0.85);
+  color: #d1fae5;
+}
+
+.led-toast-warn {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(58, 42, 14, 0.85);
+  color: #fef3c7;
+}
+
+.led-toast-err {
+  border-color: rgba(251, 113, 133, 0.55);
+  background: rgba(64, 19, 31, 0.88);
+  color: #ffe4e6;
+}
+
+/* ---------- Quick Play Intro ---------- */
+.led-play-intro {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: rgba(25, 35, 59, 0.72);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.led-inline-docs-link {
+  font-weight: 700;
+  color: var(--accent-mint);
+  white-space: nowrap;
+}
+
+/* ---------- Main Grid Layout ---------- */
+.led-play-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+  gap: 1rem;
+  align-items: start;
+  margin-bottom: 1rem;
+}
+
+.led-side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.led-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 1rem;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.32);
+}
+
+.led-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.85rem;
+}
+
+.led-kicker {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+}
+
+.led-kicker-ranked {
+  color: var(--accent-mint);
+}
+
+.led-card-title {
+  margin: 0.1rem 0 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.led-timer-readout {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.95rem;
+  font-weight: 700;
+  padding: 0.3rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-mint);
+}
+
+/* ---------- Species Bar ---------- */
+.led-species-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 0.9rem;
+}
+
+.led-species-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  text-align: left;
+}
+
+.led-species-btn.active {
+  border-color: var(--accent-cyan);
+  background: rgba(103, 232, 249, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(103, 232, 249, 0.35);
+}
+
+.led-species-name {
+  font-weight: 700;
+  font-size: 0.92rem;
+}
+
+.led-species-tag {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* ---------- Interactive Stage + Lamp Rail ---------- */
+.led-stage-Interactive {
+  display: block;
+  margin-bottom: 0.9rem;
+}
+
+.led-canvas-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 400 / 420;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: #060911;
+  border: 1px solid var(--border-subtle);
+  touch-action: none;
+}
+
+.led-canvas-wrap.led-portrait-square {
+  aspect-ratio: 1 / 1;
+  max-width: min(100%, 420px);
+  margin-inline: auto;
+}
+
+#led-stage-canvas[data-session-status="egg"],
+#led-stage-canvas[data-session-status="running"],
+#led-stage-canvas[data-session-status="paused"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  pointer-events: none;
+  transform: none;
+}
+
+#led-stage-canvas[data-session-status="completed"] {
+  position: relative;
+  transform: none;
+  opacity: 1;
+}
+
+#led-scene-fx {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.led-stage-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.led-beam-layer {
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.lamp-handle {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+  background: rgba(226, 195, 157, 0.22);
+  border: 2px solid rgba(34, 211, 238, 0.85);
+  border-radius: 50%;
+  cursor: ns-resize;
+  touch-action: none;
+  z-index: 10;
+  box-shadow: 0 0 0 1px rgba(8, 12, 22, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+}
+
+.lamp-handle[hidden],
+.rail-hit[hidden],
+.led-stage-svg[data-controls="off"] #lamp-art,
+.led-stage-svg[data-controls="off"] #beam-layer,
+.led-stage-svg[data-controls="off"] > line {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+.lamp-handle:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.lamp-handle::after {
+  content: "↕";
+  font-size: 14px;
+  color: #451a03;
+  font-weight: 800;
+}
+
+.rail-hit {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 52px;
+  cursor: pointer;
+  touch-action: none;
+  z-index: 5;
+  pointer-events: auto;
+}
+
+.led-canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.led-beam-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.35;
+  transition: background 0.2s ease, opacity 0.2s ease;
+}
+
+.led-beam-overlay.lit {
+  opacity: 0.75;
+}
+
+.led-beam-overlay[data-region="0"] {
+  background: radial-gradient(ellipse at 50% 24%, rgba(103, 232, 249, 0.28), transparent 55%);
+}
+
+.led-beam-overlay[data-region="1"] {
+  background: radial-gradient(ellipse at 50% 52%, rgba(110, 231, 183, 0.28), transparent 55%);
+}
+
+.led-beam-overlay[data-region="2"] {
+  background: radial-gradient(ellipse at 50% 78%, rgba(192, 132, 252, 0.28), transparent 55%);
+}
+
+.led-levelup-badge {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  background: rgba(9, 16, 30, 0.92);
+  border: 1px solid var(--accent-mint);
+  color: var(--accent-mint);
+  font-weight: 700;
+  font-size: 0.86rem;
+  pointer-events: none;
+  box-shadow: 0 0 18px rgba(110, 231, 183, 0.45);
+}
+
+@keyframes ledPulseBadge {
+  0% {
+    transform: translateX(-50%) scale(0.92);
+  }
+  50% {
+    transform: translateX(-50%) scale(1.05);
+  }
+  100% {
+    transform: translateX(-50%) scale(1);
+  }
+}
+
+.led-levelup-pulse {
+  animation: ledPulseBadge 0.38s ease-out;
+}
+
+.region-led-pulse {
+  position: absolute;
+  z-index: 6;
+  border-radius: 50%;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(
+    ellipse at center,
+    rgba(186, 255, 246, 0.62),
+    rgba(251, 191, 36, 0.12) 58%,
+    transparent 74%
+  );
+  mix-blend-mode: screen;
+}
+
+.region-led-pulse.is-live {
+  animation: led-region-crossfade 900ms ease;
+}
+
+@keyframes led-region-crossfade {
+  0% { opacity: 0.15; }
+  35% { opacity: 0.95; }
+  100% { opacity: 0.12; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .region-led-pulse.is-live {
+    animation: none;
+    opacity: 0.4;
+  }
+}
+
+.led-lamp-rail-panel {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.led-rail-label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.led-region-quick-btns {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* Visible Aim shortcuts panel intentionally removed (A4). Lamp drag/keyboard remains. */
+
+.led-mode-selector {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.led-mode-btn {
+  flex: 1;
+  padding: 0.55rem 0.85rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.led-mode-btn.active {
+  background: rgba(103, 232, 249, 0.15);
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+}
+
+.led-mode-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.led-mode-notice {
+  font-size: 0.8rem;
+  color: var(--accent-amber);
+  margin-top: 0.25rem;
+}
+
+.led-docs-catalogs {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  margin-top: 0.5rem;
+  min-width: 0;
+}
+
+.led-docs-section {
+  display: block;
+  min-width: 0;
+}
+
+.led-docs-section h3 {
+  margin: 0 0 0.35rem;
+}
+
+.led-docs-cat-item {
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.82rem;
+}
+
+.led-docs-cat-item strong {
+  display: block;
+  color: var(--accent-cyan);
+  margin-bottom: 0.35rem;
+}
+
+.led-docs-cat-item ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.led-docs-cat-item li {
+  margin-bottom: 0.25rem;
+  overflow-wrap: anywhere;
+}
+
+.led-docs-rarity-note {
+  margin-top: 0.6rem;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+}
+
+.led-docs-formula {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--accent-cyan);
+  margin: 0.5rem 0;
+  overflow-wrap: anywhere;
+}
+
+.led-controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+}
+
+/* ---------- Regional Growth List ---------- */
+.led-score-pill,
+.led-subtle-tag,
+.led-telemetry-badge {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.24rem 0.6rem;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+}
+
+.led-telemetry-badge.active {
+  border-color: rgba(110, 231, 183, 0.45);
+  color: var(--accent-mint);
+}
+
+.led-telemetry-badge.idle {
+  border-color: rgba(251, 191, 36, 0.45);
+  color: var(--accent-amber);
+}
+
+.led-regions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.led-region-item {
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.led-region-item:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.led-region-item.led-region-levelup {
+  animation: led-region-pulse 0.9s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .led-region-item.led-region-levelup {
+    animation: none;
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.55);
+  }
+}
+
+@keyframes led-region-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.0); }
+  35% { box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.55); background: rgba(34, 211, 238, 0.08); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.0); }
+}
+
+.led-docs-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  gap: 0.75rem;
+  margin: 0.35rem 0 0.2rem;
+}
+
+.led-docs-preview-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.45rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: rgba(8, 12, 22, 0.65);
+}
+
+.led-docs-preview-card img,
+.led-docs-preview-card canvas {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #070b14;
+}
+
+.led-docs-preview-name {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.led-docs-preview-pts {
+  font-size: 0.72rem;
+  color: var(--accent-cyan);
+}
+
+.led-docs-mechanics {
+  margin: 0.75rem 0 1rem;
+  padding: 0.75rem 0.9rem;
+  border-left: 3px solid var(--accent-cyan);
+  background: rgba(34, 211, 238, 0.05);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.led-region-item.aimed {
+  border-color: var(--accent-cyan);
+  background: rgba(103, 232, 249, 0.06);
+}
+
+.led-region-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.86rem;
+  margin-bottom: 0.35rem;
+}
+
+.led-region-lv {
+  color: var(--accent-cyan);
+}
+
+.led-progress-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin-bottom: 0.35rem;
+}
+
+.led-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-mint));
+}
+
+.led-region-meta {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+/* ---------- Telemetry & Schedules ---------- */
+.led-telemetry-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.led-metric-box {
+  padding: 0.55rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.led-metric-label {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.led-metric-val {
+  font-size: 0.9rem;
+}
+
+.led-schedules-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.led-schedule-card {
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.led-schedule-card.rare-open {
+  border-color: var(--accent-violet);
+  background: rgba(192, 132, 252, 0.1);
+}
+
+.led-schedule-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.25rem;
+}
+
+.led-schedule-kind {
+  font-size: 0.73rem;
+  color: var(--text-muted);
+}
+
+.led-tier-chip {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.led-tier-chip.pts-4 {
+  color: var(--accent-cyan);
+  background: rgba(103, 232, 249, 0.15);
+}
+
+.led-tier-chip.pts-8 {
+  color: var(--accent-amber);
+  background: rgba(251, 191, 36, 0.18);
+}
+
+.led-schedule-current {
+  font-size: 0.98rem;
+  font-weight: 700;
+  margin-bottom: 0.2rem;
+}
+
+.led-schedule-sub {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.led-schedule-caps {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.led-locked-box {
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-md);
+  background: rgba(16, 28, 48, 0.85);
+  border: 1px dashed var(--border-bright);
+  font-size: 0.82rem;
+}
+
+.led-locked-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.35rem;
+}
+
+/* ---------- Profile & Display Name ---------- */
+.led-profile-info {
+  font-size: 0.83rem;
+  margin-bottom: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.led-name-input-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
+}
+
+.led-input {
+  flex: 1 1 160px;
+  min-width: 0;
+  padding: 0.45rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-main);
+}
+
+/* ---------- Completed Result Card ---------- */
+.led-result-card {
+  margin-bottom: 1rem;
+  border-color: var(--border-bright);
+}
+
+.led-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.led-result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.led-result-stat {
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.82rem;
+}
+
+.led-result-stat.highlight {
+  border-color: var(--accent-mint);
+  background: rgba(110, 231, 183, 0.1);
+}
+
+.led-result-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* ---------- Leaderboard Table ---------- */
+.led-lb-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.led-empty-state {
+  padding: 1.5rem 1rem;
+  text-align: center;
+  color: var(--text-muted);
+  background: var(--bg-panel);
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--border-subtle);
+}
+
+.led-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.led-lb-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.led-lb-table th,
+.led-lb-table td {
+  padding: 0.6rem 0.65rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.led-lb-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+}
+
+.led-lb-row {
+  cursor: pointer;
+}
+
+.led-lb-row:hover {
+  background: rgba(103, 232, 249, 0.07);
+}
+
+.led-lb-player {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.led-lb-name {
+  font-weight: 700;
+}
+
+.led-lb-total {
+  color: var(--accent-mint);
+}
+
+/* ---------- Public NFT Detail View ---------- */
+.led-nft-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 480px) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.led-nft-canvas-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.led-nft-meta-card {
+  padding: 1rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.led-nft-owner-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 0.75rem;
+  font-size: 0.88rem;
+}
+
+.led-break-all {
+  word-break: break-all;
+}
+
+.led-nft-trait-list {
+  margin: 0.4rem 0 1rem;
+  padding-left: 1.2rem;
+  font-size: 0.88rem;
+}
+
+.led-nft-total-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-sm);
+  background: rgba(110, 231, 183, 0.12);
+  border: 1px solid var(--accent-mint);
+  font-size: 1.05rem;
+}
+
+/* ---------- Docs Page ---------- */
+.led-docs-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.led-docs-block {
+  padding: 1rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.9rem;
+}
+
+.led-docs-block h2 {
+  margin-top: 0;
+  font-size: 1.02rem;
+  color: var(--accent-cyan);
+}
+
+.led-docs-experimental {
+  border-color: rgba(251, 191, 36, 0.45);
+}
+
+/* ---------- Modal Sheet ---------- */
+.led-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(4, 7, 15, 0.78);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.led-modal {
+  width: 100%;
+  max-width: 480px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-lg);
+  padding: 1.15rem;
+}
+
+.led-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.led-modal-head h2 {
+  margin: 0;
+  font-size: 1.08rem;
+}
+
+.led-modal-sub,
+.led-subtle,
+.led-section-note {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.led-connector-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.led-connector-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.65rem 0.85rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.led-connector-btn:hover {
+  border-color: var(--accent-cyan);
+}
+
+.led-connected-box {
+  padding: 0.75rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+/* ---------- Round 5 Egg Selector Cards ---------- */
+.led-egg-selector-card {
+  margin-bottom: 1rem;
+}
+
+.led-egg-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.85rem;
+  margin-top: 0.75rem;
+}
+
+.led-egg-card-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 1rem 0.75rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 2px solid var(--border-subtle);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: center;
+}
+
+.led-egg-card-btn:hover {
+  border-color: var(--accent-cyan);
+  background: rgba(34, 211, 238, 0.05);
+  transform: translateY(-2px);
+}
+
+.led-egg-card-btn.selected {
+  border-color: var(--accent-cyan);
+  background: rgba(34, 211, 238, 0.12);
+  box-shadow: 0 0 16px rgba(34, 211, 238, 0.25);
+}
+
+.led-egg-preview-img {
+  width: 110px;
+  height: 110px;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.45));
+}
+
+.led-egg-card-name {
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: var(--text-bright);
+}
+
+.led-egg-card-tag {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+/* ---------- Top 3 Leaderboard Canonical Portraits ---------- */
+.led-lb-top3-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.led-top3-card {
+  position: relative;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  transition: border-color 0.2s ease;
+}
+
+.led-top3-card:hover {
+  border-color: var(--accent-amber);
+}
+
+.led-top3-portrait-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+  background: #060911;
+  border: 1px solid var(--border-subtle);
+}
+
+.led-top3-portrait-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.led-top3-rank-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 800;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.led-top3-rank-1 { color: #f59e0b; border-color: #f59e0b; }
+.led-top3-rank-2 { color: #94a3b8; border-color: #94a3b8; }
+.led-top3-rank-3 { color: #d97706; border-color: #d97706; }
+
+.led-top3-name {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.led-top3-wallet {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem;
+}
+
+.led-top3-score {
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: var(--accent-cyan);
+}
+
+/* ---------- Account Menu Popover ---------- */
+.led-account-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.led-account-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.led-account-btn:hover {
+  border-color: var(--accent-cyan);
+}
+
+.led-account-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  left: auto;
+  width: 290px;
+  max-width: calc(100vw - 16px);
+  background: var(--bg-card);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-md);
+  padding: 0.85rem;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  z-index: 50;
+  box-sizing: border-box;
+}
+
+.led-account-menu {
+  position: relative;
+}
+
+.led-account-allowance {
+  padding: 0.45rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  font-size: 0.8rem;
+  color: var(--accent-cyan);
+  margin-bottom: 0.65rem;
+}
+
+.led-maturity-text {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+/* ---------- Responsive Breakpoints (320 / 390 / 768 / 1440) ---------- */
+@media (max-width: 980px) {
+  .led-play-grid,
+  .led-nft-detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 420px) {
+  .led-docs-preview-grid {
+    grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    gap: 0.55rem;
+  }
+  .lamp-handle {
+    width: 36px;
+    height: 36px;
+  }
+}
+
+@media (max-width: 640px) {
+  .led-shell {
+    padding: 0.5rem 0.55rem 2rem;
+  }
+  .led-card {
+    padding: 0.75rem;
+  }
+  .led-topbar {
+    gap: 0.5rem;
+  }
+  .led-brand {
+    font-size: 0.98rem;
+  }
+  .led-card-title,
+  .led-docs-block h2 {
+    overflow-wrap: anywhere;
+    hyphens: auto;
+  }
+  .led-egg-cards-grid {
+    grid-template-columns: 1fr;
+  }
+  .led-egg-preview-img {
+    width: 96px;
+    height: 96px;
+  }
+  .led-lb-top3-grid {
+    grid-template-columns: 1fr;
+  }
+  .led-telemetry-metrics,
+  .led-schedules-grid,
+  .led-species-bar,
+  .led-docs-catalogs {
+    grid-template-columns: 1fr;
+  }
+  .led-btn-primary,
+  .led-btn-secondary,
+  .led-btn-ghost,
+  .led-controls-row {
+    white-space: normal;
+    text-align: center;
+  }
+  .led-result-summary,
+  .led-nft-meta-col,
+  .led-section-note {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 390px) {
+  .led-shell {
+    padding: 0.4rem 0.4rem 1.75rem;
+  }
+  .led-nav {
+    gap: 0.35rem;
+  }
+  .led-nav-link {
+    padding: 0.35rem 0.5rem;
+    font-size: 0.82rem;
+  }
+  .lamp-handle {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
