@@ -1,12 +1,55 @@
-# Squeek Hatchery — LED Cyber-Laboratory
+# Squeek Hatchery
 
-An English-language community character demo powered by live Squeekchain hardware telemetry. Illuminate an egg for 60 seconds, direct growth across three anatomical regions, and reveal a canonical LED hamster portrait. Guests play in browser memory; verified Ethereum wallets can save results and compete on the weekly leaderboard.
+**Hatch and raise your own hamster.**
 
-**The current application is in [`squeek-hatchery-demo/`](squeek-hatchery-demo/).** The earlier root-level JavaScript prototype is retained for history and reference. Run the commands below inside the current application folder.
+A community character-incubation game powered by live Squeekchain hamster activity, with LED-dot artwork, downloadable portraits, wallet-verified saved results, and a weekly leaderboard.
+
+**[Play Squeek Hatchery](https://squeek-hatchery.xyz/)** · [In-game Docs](https://squeek-hatchery.xyz/docs) · [Weekly leaderboard](https://squeek-hatchery.xyz/leaderboard)
+
+The current application is in [`squeek-hatchery-demo/`](squeek-hatchery-demo/). Run the development and build commands from that folder. Earlier root-level prototype files are retained as historical source.
+
+## How to play
+
+1. Choose a **Pulse**, **Relay**, or **Prism** egg. Confirming the egg locks its species.
+2. Move the heat lamp beside the stationary egg using pointer, touch, or keyboard controls. Warm **Head**, **Body & Chest**, and **Belly & Tail** to develop those regions.
+3. Complete **60 seconds of valid illumination**. Wheel speed affects lamp intensity; a resting wheel still supplies gentle base warmth while its signal remains valid.
+4. Reveal the finished hamster, accessory, and background. Export the completed **1600×1600 PNG** and **JSON metadata**.
+
+During incubation the shell reveals the hamster only through the illuminated area; the final accessory and background stay hidden until completion. Coat palette follows wheel distance, and cyber accessory follows wheel effort. Both lock together at first illumination. Rarer traits appear less often.
+
+There is no manual Pause/Resume. Restarting or reconnecting an unfinished attempt keeps the chosen egg, clears unfinished growth and trait locks, and requires fresh illumination. Completed saved results stay completed. **New Egg** returns to species selection.
+
+## Growth and score
+
+| Region | Level | Points |
+| --- | --- | --- |
+| Head | Lv0–Lv10 | 0–10 |
+| Body & Chest | Lv0–Lv10 | 0–10 |
+| Belly & Tail | Lv0–Lv10 | 0–10 |
+
+Each integer region level contributes one point. Reaching Lv10 caps that region's growth and points; it does not automatically move the lamp.
+
+**Total = Head + Body & Chest + Belly & Tail + Coat Palette + Cyber Accessory + LED Background**
+
+Regions contribute **0–30 points**. Each trait contributes **1, 2, 4, or 8 points**, giving a completed character **3–54 points** in total.
+
+| Trait | 1 point | 2 points | 4 points | 8 points |
+| --- | --- | --- | --- | --- |
+| Coat Palette | Apricot, Cocoa, Cloud, Rose | Sage, Lilac, Midnight | Pearl, Aurora | Spectrum |
+| Cyber Accessory | Lumen clasp, Aether visor, Petal mitts, Auricle clip | Holo lenses, Bio-link wraps, Companion orbs | Eclipse mask, Prism sanctuary | Aurora bloom |
+| LED Background | Mosslight Grove, Peach Cloud Terrace, Amber Mycelium, Rainlit Canopy | Tidalglass Cove, Lavender Conservatory, Moonseed Orchard | Aurora Nexus, Prism Cathedral | Celestial Bloom |
+
+## Guest, Demo, and Ranked play
+
+- **Guest and Demo:** temporary, unranked play in browser memory. Refreshing clears that local play.
+- **Ranked:** sign in by signing a SIWE wallet message. The server validates gameplay and saves completed results in SQLite. The current demo allows three saved Ranked plays per wallet per day; unfinished restarts do not consume an extra completed-play allowance.
+- **Weekly leaderboard:** the best completed character per wallet competes in the weekly Top 100. Saved characters have public result links.
+
+Wallets are used for authentication and saved Ranked play. **NFT minting is not enabled in this demo.** Included Solidity sources and artifacts are reference/test material; contract deployment fields remain null.
 
 ## Run locally
 
-Use Node.js 24 or newer. Clone the entire repository so the sibling runtime art folder is present:
+Use **Node.js 24 or newer** and clone the whole repository, including the sibling artwork folder:
 
 ```sh
 cd squeek-hatchery-demo
@@ -14,9 +57,9 @@ npm ci
 npm run dev
 ```
 
-Open the local URL printed by Vite. The development server includes the SQLite API and runtime artwork.
+Open the local URL printed by Vite. The development server includes the SQLite API and artwork mount.
 
-## Production
+## Build and serve
 
 ```sh
 cd squeek-hatchery-demo
@@ -25,73 +68,16 @@ npm run build
 node --experimental-strip-types src/server.ts
 ```
 
-The Node server serves `dist/`, `/api/*`, and `/lab-assets/*`. It defaults to `127.0.0.1:4173`. Set `HOST` and `PORT` as needed; put an HTTPS reverse proxy in front of it for public use. Set `SQUEEK_DB_PATH` to a persistent path outside deployment releases. The default database path is `cache/hatchery-backend.sqlite`.
+The production server serves `dist/`, `/api/*`, and `/lab-assets/*`. It defaults to `127.0.0.1:4173`; configure `HOST` and `PORT` as needed and use an HTTPS reverse proxy for public access. Set `SQUEEK_DB_PATH` to a persistent location outside deployment releases. The default is `cache/hatchery-backend.sqlite`.
 
-Canvas/browser security features and wallet sign-in require a secure browser context: use localhost for development and HTTPS for a public deployment. Publishing this repository does not update the separately deployed VPS.
+Use localhost for development and HTTPS for public play. Publishing source to GitHub does not automatically redeploy the VPS.
 
-## Included features
+## Source and validation
 
-- Three hamster species with independent Head / Middle / Lower growth, Lv0–10.
-- Ten coat palettes, ten cyber accessories, and ten LED backgrounds.
-- Hardware freshness validation, shared telemetry polling, server-authoritative ranked sessions, and restart recovery.
-- SIWE wallet authentication, optional display names, a weekly Top 100, and public result links.
-- 1600×1600 PNG and JSON exports; guest/demo progress remains ephemeral.
-- Experimental, versioned scoring policies. The source is authoritative for current calibration and game rules.
+- [`squeek-hatchery-demo/`](squeek-hatchery-demo/): current TypeScript/Vite frontend, Node/SQLite API, tests, and reference contract artifacts.
+- [`hamster-trait-lab/assets/`](hamster-trait-lab/assets/): runtime character atlases and LED backgrounds, kept alongside the application.
+- Earlier root-level prototype files: historical source, separate from the current application.
 
-The current character demo uses wallets for authentication and ranked persistence. NFT minting is deferred; contract deployment fields remain null, and the included Solidity contracts are test/reference source.
+`npm run build` includes TypeScript checking. The published application passed the production build and **85 non-browser logic/API tests**. See [the application README](squeek-hatchery-demo/README.md) for its non-browser test command, runtime asset list, and optional browser/contract test prerequisites. No new real-wallet sign-in or browser export check is claimed by that test count.
 
-## Source layout and validation
-
-- `squeek-hatchery-demo/`: current TypeScript/Vite frontend, Node/SQLite API, tests, and contract/reference artifacts.
-- `hamster-trait-lab/assets/`: required runtime character atlases and LED backgrounds, kept alongside the application to match its asset mounts.
-- Original root-level files: previous browser-local prototype.
-
-`npm run build` includes TypeScript checking. `npm test` runs the application test files; browser tests need their documented local browser runtime. See the current application's README for the portable non-browser test command and asset details.
-
-The LED demo builds on [the upstream v0.2.0 source](https://github.com/identity-md-launches/launch-2854-build-squeek-hatchery-company) pinned in `squeek-hatchery-demo/UPSTREAM.json`. Third-party notices are retained under `squeek-hatchery-demo/artifacts/`.
-
-<details>
-<summary>Original prototype documentation</summary>
-
-# Squeek Hatchery
-
-An English-language, unofficial Squeekchain incubation prototype. A real hamster powers a movable lamp; drag the lamp vertically to allocate growth to ears, fur or a short pom tail. The egg stays still and the lamp aims along the local surface normal. Incubate for 60 seconds of valid, visible play, name your creature, save it locally or export SVG/JSON.
-
-## Run
-
-Node 22 or newer. `npm ci`, then `npm run dev`. `npm run build` creates a relative-path static export in `dist/`. `npm test` checks growth, work accounting, data validation, exported images and ERC721 behavior on a local EVM. `npm run compile` emits ABI and bytecode in `artifacts/`.
-
-## Controls and rules
-
-Drag the lamp vertically, use Up/Down/Home/End on the focused lamp, or select Head / Body / Belly. The egg stays fixed. The lamp moves on a vertical rail and changes angle along the normal of the egg's ellipse. Surface lighting is a stylized 2D approximation. Only the illuminated anatomy region grows. Ears stay rounded, body outline becomes fluffy, and the tail stays a short pom. IDLE supplies a labeled 12% maintenance glow; unavailable hardware pauses the session with a three-second recovery countdown.
-
-`src/incubation.js` defines the current rules and renderer; `src/model.js` retains shared validation and the legacy portrait renderer so older saved creatures stay recognizable. Local coat exposure is recorded in 15 soft vertical bands, matching the vertical-only lamp control. More exposure increases color opacity to a cap. Other bands retain their color. New color smoothly replaces the old hue without subtractive paint mixing. Pattern family and layout lock at incubation start, using exact hardware work counters. New positive work reveals the locked pattern only under the lamp. Patterns decorate the front-facing forehead, chest and belly; the eye/nose area stays clear. The short pom tail never becomes a rat-like tail.
-
-### Live appearance schedule
-
-| Input | Appearance rule |
-| --- | --- |
-| Daily distance | Ordinary color changes every 5 meters; UTC date + distance segment determine hue. |
-| 250, 750, 1,250... meters | Pearl passage, lasting 5 meters. |
-| 500, 1,000, 1,500... meters | Rainbow passage, lasting 5 meters. |
-| Cumulative work | Ordinary spots / patches / stripes rotate every 50 work units. Layout is stable within each bucket. |
-| 1,000–1,199; 3,000–3,199... work | Star spots are available for new eggs. |
-| 2,000–2,199; 4,000–4,199... work | Swirls are available for new eggs. |
-
-The special pattern window is a **200-work-unit opportunity to start an egg**, not a timer or an expiry on a collected creature. After a window closes, ordinary patterns resume from the current 50-unit bucket. A locked egg never switches pattern mid-session. The UI shows current/next color and pattern, distance/work remaining, and the locked state. Work units are API units, not verified wheel revolutions. All thresholds are provisional art rules; Real cadence should be measured before changing these thresholds.
-
-More light deepens local color. Rainbow and pearl affect only exposed bands; changing the lamp height preserves other bands. Re-exposing a band to another color gradually replaces it. No color picker, saved palette or public simulation controls. A resting hamster preserves the current distance/color within the UTC day; the API daily distance/date reset starts a new day's palette. Counter epoch changes cannot add artificial work to an egg. These mappings do not guarantee unique collectibles or physically accurate genetics.
-
-## NFT implementation and deployment boundary
-
-`contracts/SqueekHatchery.sol` uses OpenZeppelin ERC721URIStorage. Minting is free and nonpayable. Exact metadata with an embedded SVG is stored in the token URI, with no external image host or setter exposed by this contract. Metadata may be large and therefore gas-intensive: this is intended for Sepolia experiments. Caller-provided art is NOT proof of a genuine hardware session. The same wallet cannot mint a given session ID twice; a new ID or wallet can create another token. There is no fixed supply or authenticated session oracle.
-
-No contract has been deployed and no transaction has been sent by this prototype. Until an actual deployed address is configured, the mint button clearly says it is unavailable. For deployment: compile/review/test the contract, deploy it on **Sepolia (11155111)**, verify source, then configure `VITE_HATCHERY_CONTRACT` and rebuild. The wallet pays Sepolia gas only and must confirm its own transaction. Never commit a private key. The UI checks chain ID and contract bytecode, submits `mint`, and waits for a real receipt. Compatible injected Ethereum wallet required. No mainnet payments.
-
-## Project status
-
-This is an editable community prototype. Artwork, lighting and balance remain open to refinement. See VALIDATION.md for completed checks and remaining verification. All UI and documentation are in English.
-
-Collection records are saved only in the current browser. SVG and JSON downloads are portable backups. The prototype supports the latest 30 local companions. No user tracking or backend.
-
-</details>
+The LED demo builds on the [upstream v0.2.0 source](https://github.com/identity-md-launches/launch-2854-build-squeek-hatchery-company), pinned in [`UPSTREAM.json`](squeek-hatchery-demo/UPSTREAM.json). Third-party notices remain under [`artifacts/`](squeek-hatchery-demo/artifacts/). The [original prototype README](https://github.com/0xvictorvn/squeek-hatchery/blob/c7511c93dd356628aa3fe453201dae3e1d0a333b/README.md) is available in Git history.

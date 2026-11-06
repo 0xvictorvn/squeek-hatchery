@@ -1,6 +1,6 @@
 # Squeek Hatchery — current LED demo
 
-See the [repository README](../README.md) for setup, production serving, and the project overview. This is the same application source as the deployed LED character demo.
+See the [repository README](../README.md) for the current gameplay, complete trait point tables, scoring, setup, and production serving. This is the same application source as the deployed LED character demo.
 
 ## Requirements and runtime assets
 
@@ -25,6 +25,6 @@ The historical `scripts/check-delivery.mjs` tool checks a scoped source/artifact
 
 ## Demo boundary and attribution
 
-Wallets authenticate SIWE sessions and save ranked results. NFT minting is deferred; `public/hatchery.config.json` keeps deployment fields null. The current experimental game rules live in `src/game-policy.ts`; server authority and persistent storage live in `src/backend.ts`.
+Wallets authenticate SIWE sessions and save ranked results. NFT minting is deferred; `public/hatchery.config.json` keeps deployment fields null. The current game rules live in `src/game-policy.ts`; server authority and persistent storage live in `src/backend.ts`.
 
 The pinned upstream source is recorded in `UPSTREAM.json`. Third-party license notices remain under `artifacts/`; contract artifacts and their deployment/proof documentation are retained as reference material.
