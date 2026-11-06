@@ -81,3 +81,7 @@ Use localhost for development and HTTPS for public play. Publishing source to Gi
 `npm run build` includes TypeScript checking. The published application passed the production build and **85 non-browser logic/API tests**. See [the application README](squeek-hatchery-demo/README.md) for its non-browser test command, runtime asset list, and optional browser/contract test prerequisites. No new real-wallet sign-in or browser export check is claimed by that test count.
 
 The LED demo builds on the [upstream v0.2.0 source](https://github.com/identity-md-launches/launch-2854-build-squeek-hatchery-company), pinned in [`UPSTREAM.json`](squeek-hatchery-demo/UPSTREAM.json). Third-party notices remain under [`artifacts/`](squeek-hatchery-demo/artifacts/). The [original prototype README](https://github.com/0xvictorvn/squeek-hatchery/blob/c7511c93dd356628aa3fe453201dae3e1d0a333b/README.md) is available in Git history.
+
+## Project verification
+
+squeekchain-project: 55d19c86-16e9-400e-94b9-7dc9f147ba7c
