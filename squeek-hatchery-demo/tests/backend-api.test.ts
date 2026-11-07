@@ -9,15 +9,11 @@ import {
   HatcheryBackend,
   SESSION_TTL_MS,
 } from "../src/backend.ts";
-import { EXPERIMENTAL_POLICY_V1 } from "../src/game-policy.ts";
+import { EXPERIMENTAL_POLICY_V1, EXPERIMENTAL_POLICY_V4 } from "../src/game-policy.ts";
 import { measurementDayKey, type Reading } from "../src/rules.ts";
 
-const WALLET_A = privateKeyToAccount(
-  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
-);
-const WALLET_B = privateKeyToAccount(
-  "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
-);
+const WALLET_A = privateKeyToAccount(generatePrivateKey());
+const WALLET_B = privateKeyToAccount(generatePrivateKey());
 
 async function startTestBackendServer(options: {
   dbPath?: string;
@@ -811,3 +807,636 @@ test("Weekly Top 100 Leaderboard & Public NFT View: 0, 1, 100, >100 records, tie
     }
   }
 });
+
+type OrderedRankedSession = {
+  id: string;
+  status: string;
+  lampPosition: number;
+  elapsed: number;
+  lockedTraits: unknown;
+  regions: { dose: number; exposure: number; level: number }[];
+  intentOrder?: { attemptId: string; aimIntent: number; revision: number; adopted: boolean };
+};
+
+function rankedDoses(session: OrderedRankedSession): [number, number, number] {
+  return [session.regions[0]!.dose, session.regions[1]!.dose, session.regions[2]!.dose];
+}
+
+test("ordered tick and aim keep the newest lamp and match the no-reorder regional doses", async () => {
+  const ctx = await startTestBackendServer({ initialTimeMs: Date.parse("2026-11-07T13:00:00.000Z") });
+  try {
+    const auth = await ctx.signInAccount(WALLET_A);
+    const orderOf = (session: OrderedRankedSession) => {
+      assert.ok(session.intentOrder);
+      return session.intentOrder;
+    };
+    const claim = async (lampPosition: number) => {
+      const egg = await ctx.request<{ session: OrderedRankedSession }>("/api/session/egg", {
+        method: "POST",
+        cookie: auth.cookie,
+        body: { familyId: "pulse", lampPosition },
+      });
+      assert.equal(egg.status, 201);
+      const started = await ctx.request<{ session: OrderedRankedSession }>("/api/session/start", {
+        method: "POST",
+        cookie: auth.cookie,
+        body: {
+          sessionId: egg.data.session.id,
+          lampPosition,
+          attemptId: orderOf(egg.data.session).attemptId,
+          aimIntent: 0,
+        },
+      });
+      assert.equal(started.status, 200);
+      assert.equal(started.data.session.lampPosition, lampPosition);
+      assert.equal(orderOf(started.data.session).adopted, true);
+      return started.data.session;
+    };
+    const postSession = async (pathname: string, body: Record<string, unknown>, status = 200) => {
+      const response = await ctx.request<{ session?: OrderedRankedSession; error?: string }>(pathname, {
+        method: "POST",
+        cookie: auth.cookie,
+        body,
+      });
+      assert.equal(response.status, status, response.data.error ?? "");
+      return response;
+    };
+    const playControl = async () => {
+      const started = await claim(-80);
+      const attemptId = orderOf(started).attemptId;
+      ctx.advanceTimeMs(1000);
+      const middle = await postSession("/api/session/aim", {
+        sessionId: started.id,
+        lampPosition: 0,
+        attemptId,
+        aimIntent: 1,
+      });
+      ctx.advanceTimeMs(1000);
+      const lower = await postSession("/api/session/aim", {
+        sessionId: started.id,
+        lampPosition: 80,
+        attemptId,
+        aimIntent: 2,
+      });
+      ctx.advanceTimeMs(1000);
+      const done = await postSession("/api/session/tick", {
+        sessionId: started.id,
+        lampPosition: 80,
+        attemptId,
+        aimIntent: 2,
+      });
+      await postSession("/api/session/abandon", { sessionId: started.id });
+      return { middle: middle.data.session!, lower: lower.data.session!, done: done.data.session! };
+    };
+    const control = await playControl();
+    assert.ok(control.done.regions[0]!.dose > 0);
+    assert.ok(control.done.regions[1]!.dose > 0);
+    assert.ok(control.done.regions[2]!.dose > 0);
+
+    const started = await claim(-80);
+    const attemptId = orderOf(started).attemptId;
+    ctx.advanceTimeMs(1000);
+    const heldTick = holdJson(ctx.origin, "/api/session/tick", auth.cookie, {
+      sessionId: started.id,
+      lampPosition: -80,
+      attemptId,
+      aimIntent: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(heldTick.finished(), false);
+    const middle = await postSession("/api/session/aim", {
+      sessionId: started.id,
+      lampPosition: 0,
+      attemptId,
+      aimIntent: 1,
+    });
+    heldTick.release();
+    const late = await heldTick.done;
+    assert.equal(late.status, 200);
+    const lateSession = late.data.session!;
+    assert.equal(lateSession.lampPosition, 0);
+    assert.deepEqual(rankedDoses(lateSession), rankedDoses(middle.data.session!));
+    ctx.advanceTimeMs(1000);
+    const lower = await postSession("/api/session/aim", {
+      sessionId: started.id,
+      lampPosition: 80,
+      attemptId,
+      aimIntent: 2,
+    });
+    ctx.advanceTimeMs(1000);
+    const done = await postSession("/api/session/tick", {
+      sessionId: started.id,
+      lampPosition: 80,
+      attemptId,
+      aimIntent: 2,
+    });
+    assert.equal(done.data.session!.lampPosition, 80);
+    assert.deepEqual(rankedDoses(done.data.session!), rankedDoses(control.done));
+    assert.deepEqual(rankedDoses(lower.data.session!), rankedDoses(control.lower));
+    assert.equal(done.data.session!.intentOrder!.aimIntent, 2);
+    await postSession("/api/session/abandon", { sessionId: started.id });
+
+    const reversed = await claim(-80);
+    const reversedAttempt = orderOf(reversed).attemptId;
+    ctx.advanceTimeMs(1000);
+    const heldAim = holdJson(ctx.origin, "/api/session/aim", auth.cookie, {
+      sessionId: reversed.id,
+      lampPosition: 10,
+      attemptId: reversedAttempt,
+      aimIntent: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const newerAim = await postSession("/api/session/aim", {
+      sessionId: reversed.id,
+      lampPosition: 50,
+      attemptId: reversedAttempt,
+      aimIntent: 2,
+    });
+    heldAim.release();
+    const olderAim = await heldAim.done;
+    assert.equal(olderAim.status, 200);
+    assert.equal(olderAim.data.session!.lampPosition, 50);
+    assert.equal(newerAim.data.session!.lampPosition, 50);
+    assert.equal(olderAim.data.session!.intentOrder!.aimIntent, 2);
+
+    ctx.advanceTimeMs(200);
+    const beforeStale = olderAim.data.session!;
+    const staleBeat = await postSession("/api/session/tick", {
+      sessionId: reversed.id,
+      lampPosition: -80,
+      attemptId: reversedAttempt,
+      aimIntent: 1,
+    });
+    assert.equal(staleBeat.data.session!.lampPosition, 50);
+    assert.ok(staleBeat.data.session!.elapsed > beforeStale.elapsed);
+    assert.equal(staleBeat.data.session!.regions[0]!.dose, beforeStale.regions[0]!.dose);
+    assert.equal(staleBeat.data.session!.regions[1]!.dose, beforeStale.regions[1]!.dose);
+    assert.ok(staleBeat.data.session!.regions[2]!.dose > beforeStale.regions[2]!.dose);
+
+    const malformed = await postSession(
+      "/api/session/aim",
+      { sessionId: reversed.id, lampPosition: -80, attemptId: reversedAttempt, aimIntent: 1.5 },
+      400,
+    );
+    assert.match(malformed.data.error ?? "", /malformed/i);
+    const half = await postSession(
+      "/api/session/tick",
+      { sessionId: reversed.id, lampPosition: -80, attemptId: reversedAttempt },
+      400,
+    );
+    assert.match(half.data.error ?? "", /together/i);
+    const authoritative = await postSession(
+      "/api/session/tick",
+      { sessionId: reversed.id, lampPosition: 50, attemptId: reversedAttempt, aimIntent: 2, elapsed: 60, intentOrder: { revision: 999 } },
+      400,
+    );
+    assert.match(authoritative.data.error ?? "", /forbidden/i);
+    const unchanged = await ctx.request<{ session: OrderedRankedSession }>("/api/session/active", { cookie: auth.cookie });
+    assert.equal(unchanged.data.session.lampPosition, 50);
+    assert.equal(unchanged.data.session.elapsed, staleBeat.data.session!.elapsed);
+
+    ctx.advanceTimeMs(200);
+    const legacyOverwrite = await postSession("/api/session/tick", {
+      sessionId: reversed.id,
+      lampPosition: -80,
+    });
+    assert.equal(legacyOverwrite.data.session!.lampPosition, 50);
+    assert.ok(legacyOverwrite.data.session!.elapsed > staleBeat.data.session!.elapsed);
+    await postSession("/api/session/abandon", { sessionId: reversed.id });
+
+    const legacy = await ctx.request<{ session: OrderedRankedSession }>("/api/session/egg", {
+      method: "POST",
+      cookie: auth.cookie,
+      body: { familyId: "pulse", lampPosition: -70 },
+    });
+    assert.equal(legacy.status, 201);
+    const stored = ctx.backend.db
+      .prepare("SELECT session_json, assigned_background_index FROM ranked_sessions WHERE session_id = ?")
+      .get(legacy.data.session.id) as { session_json: string; assigned_background_index: number };
+    const stripped = JSON.parse(stored.session_json) as OrderedRankedSession;
+    delete stripped.intentOrder;
+    ctx.backend.db
+      .prepare("UPDATE ranked_sessions SET session_json = ? WHERE session_id = ?")
+      .run(JSON.stringify(stripped), legacy.data.session.id);
+    const startedLegacy = await postSession("/api/session/start", { sessionId: legacy.data.session.id });
+    assert.equal(startedLegacy.data.session!.status, "running");
+    assert.equal(startedLegacy.data.session!.intentOrder?.adopted, false);
+    ctx.advanceTimeMs(1000);
+    const legacyAim = await postSession("/api/session/aim", { sessionId: legacy.data.session.id, lampPosition: 80 });
+    assert.equal(legacyAim.data.session!.lampPosition, 80);
+    assert.equal(legacyAim.data.session!.intentOrder?.adopted, false);
+    const legacyOrder = legacyAim.data.session!.intentOrder!;
+    const adoptedResponse = await postSession("/api/session/aim", {
+      sessionId: legacy.data.session.id,
+      lampPosition: 20,
+      attemptId: legacyOrder.attemptId,
+      aimIntent: legacyOrder.aimIntent + 1,
+    });
+    const adopted = adoptedResponse.data.session!;
+    assert.equal(adopted.lampPosition, 20);
+    assert.equal(adopted.intentOrder?.adopted, true);
+    ctx.advanceTimeMs(200);
+    const blocked = await postSession("/api/session/tick", { sessionId: legacy.data.session.id, lampPosition: -80 });
+    assert.equal(blocked.data.session!.lampPosition, 20);
+    assert.ok(blocked.data.session!.elapsed > adopted.elapsed);
+    const oldAttempt = adopted.intentOrder!.attemptId;
+    const restarted = await postSession("/api/session/restart", { sessionId: legacy.data.session.id });
+    assert.equal(restarted.data.session!.status, "egg");
+    assert.equal(restarted.data.session!.elapsed, 0);
+    assert.notEqual(restarted.data.session!.intentOrder!.attemptId, oldAttempt);
+    const staleRestart = await postSession(
+      "/api/session/tick",
+      { sessionId: legacy.data.session.id, lampPosition: 70, attemptId: oldAttempt, aimIntent: 9 },
+      409,
+    );
+    assert.equal(staleRestart.data.error, "Stale ranked intent.");
+    const afterStale = await ctx.request<{ session: OrderedRankedSession }>("/api/session/active", { cookie: auth.cookie });
+    assert.equal(afterStale.data.session.status, "egg");
+    assert.equal(afterStale.data.session.lampPosition, restarted.data.session!.lampPosition);
+    assert.equal(afterStale.data.session.intentOrder!.attemptId, restarted.data.session!.intentOrder!.attemptId);
+    await postSession("/api/session/abandon", { sessionId: legacy.data.session.id });
+
+    const gapped = await claim(0);
+    const gapAttempt = orderOf(gapped).attemptId;
+    ctx.advanceTimeMs(21_000);
+    const gap = await postSession("/api/session/tick", {
+      sessionId: gapped.id,
+      lampPosition: 0,
+      attemptId: gapAttempt,
+      aimIntent: 0,
+    });
+    assert.equal(gap.data.session!.status, "paused");
+    assert.equal(gap.data.session!.elapsed, 0);
+    assert.ok(gap.data.session!.lockedTraits);
+    assert.notEqual(gap.data.session!.intentOrder!.attemptId, gapAttempt);
+    const gapStale = await postSession(
+      "/api/session/aim",
+      { sessionId: gapped.id, lampPosition: 80, attemptId: gapAttempt, aimIntent: 4 },
+      409,
+    );
+    assert.equal(gapStale.data.error, "Stale ranked intent.");
+    const gapStored = await ctx.request<{ session: OrderedRankedSession }>("/api/session/active", { cookie: auth.cookie });
+    assert.equal(gapStored.data.session.status, "paused");
+    assert.equal(gapStored.data.session.elapsed, 0);
+    assert.ok(gapStored.data.session.lockedTraits);
+    assert.equal(gapStored.data.session.lampPosition, gap.data.session!.lampPosition);
+    assert.equal(gapStored.data.session.intentOrder!.attemptId, gap.data.session!.intentOrder!.attemptId);
+    await postSession("/api/session/abandon", { sessionId: gapped.id });
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("a stale telemetry failure does not reset a newer ranked attempt", async () => {
+  let now = Date.parse("2026-11-07T13:00:00.000Z");
+  const telemetryGate: { resolve?: () => void } = {};
+  let mode: "ok" | "wait" | "fault" = "ok";
+  const reading = () => ({
+    coreStatus: "ACTIVE" as const,
+    rpm: 65,
+    meters: 300,
+    distanceMm: 300_000,
+    work: 400n,
+    counterEpoch: "order-fence",
+    installationId: "order-fence",
+    observedAt: now,
+    received: now,
+    staleAfterSeconds: 60,
+    utcDate: measurementDayKey(now),
+  });
+  const backend = new HatcheryBackend({
+    dbPath: ":memory:",
+    policy: EXPERIMENTAL_POLICY_V4,
+    autoStartProducer: false,
+    hardwareTimeoutMs: 15000,
+    now: () => now,
+    hardwareProvider: async () => {
+      if (mode === "wait") {
+        mode = "ok";
+        await new Promise<void>((resolve) => {
+          telemetryGate.resolve = resolve;
+        });
+      } else if (mode === "fault") {
+        mode = "ok";
+        throw new Error("Hardware reported fault");
+      }
+      return { reading: reading(), source: "live" as const };
+    },
+  });
+  const day = Date.parse("2026-11-07T12:00:05.000Z");
+  backend.ingestHardwareReading(
+    { ...reading(), observedAt: day, received: day, meters: 0, distanceMm: 0, work: 0n, utcDate: measurementDayKey(day) },
+    "live",
+    day,
+  );
+  try {
+    const egg = backend.claimRankedEgg(WALLET_A.address, { familyId: "pulse", lampPosition: -80 });
+    const attemptId = egg.intentOrder?.attemptId;
+    assert.ok(attemptId);
+    await backend.startRankedIllumination(WALLET_A.address, {
+      sessionId: egg.id,
+      attemptId,
+      aimIntent: 0,
+      lampPosition: -80,
+    });
+    now += 1000;
+    mode = "wait";
+    let pendingError: unknown = null;
+    const pending = backend
+      .tickRankedSession(WALLET_A.address, { sessionId: egg.id, attemptId, aimIntent: 0, lampPosition: -80 })
+      .catch((error: unknown) => {
+        pendingError = error;
+      });
+    const startedAt = Date.now();
+    while (!telemetryGate.resolve) {
+      if (Date.now() - startedAt > 2000) throw new Error("tick did not reach telemetry");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const restarted = await backend.restartRankedSession(WALLET_A.address, { sessionId: egg.id });
+    assert.equal(restarted.session.status, "egg");
+    assert.notEqual(restarted.session.intentOrder?.attemptId, attemptId);
+    const resume = telemetryGate.resolve;
+    telemetryGate.resolve = undefined;
+    if (resume) resume();
+    await pending;
+    assert.match(pendingError instanceof Error ? pendingError.message : "", /Stale ranked intent/);
+    const stored = await backend.getActiveRankedSession(WALLET_A.address);
+    assert.equal(stored?.status, "egg");
+    assert.equal(stored?.elapsed, 0);
+    assert.equal(stored?.lockedTraits, null);
+    assert.equal(stored?.intentOrder?.attemptId, restarted.session.intentOrder?.attemptId);
+
+    const nextAttempt = stored!.intentOrder!.attemptId;
+    await backend.startRankedIllumination(WALLET_A.address, {
+      sessionId: egg.id,
+      attemptId: nextAttempt,
+      aimIntent: 0,
+      lampPosition: stored!.lampPosition,
+    });
+    now += 1000;
+    await backend.tickRankedSession(WALLET_A.address, {
+      sessionId: egg.id,
+      attemptId: nextAttempt,
+      aimIntent: 0,
+      lampPosition: stored!.lampPosition,
+    });
+    const healthy = await backend.getActiveRankedSession(WALLET_A.address);
+    assert.equal(healthy?.status, "running");
+    assert.ok((healthy?.elapsed ?? 0) > 0);
+    now += 1000;
+    mode = "fault";
+    await assert.rejects(
+      backend.tickRankedSession(WALLET_A.address, {
+        sessionId: egg.id,
+        attemptId: nextAttempt,
+        aimIntent: 0,
+        lampPosition: healthy!.lampPosition,
+      }),
+      /fault/i,
+    );
+    const reset = await backend.getActiveRankedSession(WALLET_A.address);
+    assert.equal(reset?.status, "egg");
+    assert.equal(reset?.elapsed, 0);
+    assert.equal(reset?.lockedTraits, null);
+    assert.notEqual(reset?.intentOrder?.attemptId, nextAttempt);
+  } finally {
+    telemetryGate.resolve?.();
+    backend.close();
+  }
+});
+
+test("stale ordered telemetry and a late active read do not rewind the current attempt", async () => {
+  const wallet = WALLET_A.address;
+  const openBackend = (policy: typeof EXPERIMENTAL_POLICY_V1 | typeof EXPERIMENTAL_POLICY_V4) => {
+    let now = Date.parse("2026-11-07T13:00:00.000Z");
+    const reading = () => ({
+      coreStatus: "ACTIVE" as const,
+      rpm: 65,
+      meters: 300,
+      distanceMm: 300_000,
+      work: 400n,
+      counterEpoch: "order-fence",
+      installationId: "order-fence",
+      observedAt: now,
+      received: now,
+      staleAfterSeconds: 60,
+      utcDate: measurementDayKey(now),
+    });
+    const backend = new HatcheryBackend({
+      dbPath: ":memory:",
+      policy,
+      autoStartProducer: false,
+      hardwareTimeoutMs: 15000,
+      now: () => now,
+      hardwareProvider: async () => ({ reading: reading(), source: "live" as const }),
+    });
+    const day = Date.parse("2026-11-07T12:00:05.000Z");
+    backend.ingestHardwareReading(
+      { ...reading(), observedAt: day, received: day, meters: 0, distanceMm: 0, work: 0n, utcDate: measurementDayKey(day) },
+      "live",
+      day,
+    );
+    return {
+      backend,
+      raw: () => String(backend.getActiveRankedSessionRow(wallet)?.session_json ?? ""),
+    };
+  };
+  const bootRunning = async (policy: typeof EXPERIMENTAL_POLICY_V4) => {
+    const ctx = openBackend(policy);
+    try {
+      const egg = ctx.backend.claimRankedEgg(wallet, { familyId: "pulse", lampPosition: -80 });
+      const attemptId = egg.intentOrder?.attemptId;
+      assert.ok(attemptId);
+      const first = await ctx.backend.startRankedIllumination(wallet, {
+        sessionId: egg.id,
+        attemptId,
+        aimIntent: 0,
+        lampPosition: -80,
+      });
+      const oldAttemptId = first.session.intentOrder?.attemptId;
+      assert.ok(oldAttemptId);
+      const reset = await ctx.backend.restartRankedSession(wallet, {
+        sessionId: egg.id,
+        attemptId: oldAttemptId,
+        aimIntent: 0,
+      });
+      const nextAttempt = reset.session.intentOrder?.attemptId;
+      assert.ok(nextAttempt);
+      const started = await ctx.backend.startRankedIllumination(wallet, {
+        sessionId: egg.id,
+        attemptId: nextAttempt,
+        aimIntent: 0,
+        lampPosition: 80,
+      });
+      return { ...ctx, sessionId: egg.id, oldAttemptId, started: started.session };
+    } catch (error) {
+      ctx.backend.close();
+      throw error;
+    }
+  };
+
+  for (const method of ["tickRankedSession", "aimRankedSession", "startRankedIllumination", "completeRankedSession"] as const) {
+    const ctx = await bootRunning(EXPERIMENTAL_POLICY_V4);
+    try {
+      const before = ctx.raw();
+      ctx.backend.getHardwareTelemetry = async () => {
+        throw new Error("telemetry must not run for a stale attempt");
+      };
+      const call = ctx.backend[method].bind(ctx.backend) as (
+        walletAddress: string,
+        body: Record<string, unknown>,
+      ) => Promise<unknown>;
+      await assert.rejects(
+        () => call(wallet, {
+          sessionId: ctx.sessionId,
+          attemptId: ctx.oldAttemptId,
+          aimIntent: 1,
+          lampPosition: -80,
+        }),
+        /Stale ranked intent/,
+      );
+      assert.equal(ctx.raw(), before);
+    } finally {
+      ctx.backend.close();
+    }
+  }
+
+  const lowered = await bootRunning(EXPERIMENTAL_POLICY_V4);
+  try {
+    const attemptId = lowered.started.intentOrder?.attemptId;
+    assert.ok(attemptId);
+    await lowered.backend.aimRankedSession(wallet, {
+      sessionId: lowered.sessionId,
+      attemptId,
+      aimIntent: 2,
+      lampPosition: 80,
+    });
+    const before = lowered.raw();
+    lowered.backend.getHardwareTelemetry = async () => {
+      throw new Error("Synthetic offline telemetry");
+    };
+    await assert.rejects(
+      () => lowered.backend.tickRankedSession(wallet, {
+        sessionId: lowered.sessionId,
+        attemptId,
+        aimIntent: 1,
+        lampPosition: -80,
+      }),
+      /Synthetic offline telemetry/,
+    );
+    assert.equal(lowered.raw(), before);
+  } finally {
+    lowered.backend.close();
+  }
+
+  const raced = await bootRunning(EXPERIMENTAL_POLICY_V4);
+  try {
+    const realTelemetry = raced.backend.getHardwareTelemetry.bind(raced.backend);
+    const held: { reject?: (error: Error) => void } = {};
+    raced.backend.getHardwareTelemetry = () =>
+      new Promise((_, reject) => {
+        held.reject = reject;
+      }) as ReturnType<HatcheryBackend["getHardwareTelemetry"]>;
+    const pending = raced.backend.getActiveRankedSession(wallet);
+    const rejectHeld = held.reject;
+    if (!rejectHeld) throw new Error("active read did not reach telemetry");
+    raced.backend.getHardwareTelemetry = realTelemetry;
+    const reset = await raced.backend.restartRankedSession(wallet, { sessionId: raced.sessionId });
+    const nextAttempt = reset.session.intentOrder?.attemptId;
+    assert.ok(nextAttempt);
+    await raced.backend.startRankedIllumination(wallet, {
+      sessionId: raced.sessionId,
+      attemptId: nextAttempt,
+      aimIntent: 0,
+      lampPosition: 80,
+    });
+    const before = raced.raw();
+    rejectHeld(new Error("Old active read failed"));
+    await pending;
+    assert.equal(raced.raw(), before);
+    assert.equal((JSON.parse(before) as OrderedRankedSession).status, "running");
+  } finally {
+    raced.backend.close();
+  }
+
+  const legacy = openBackend(EXPERIMENTAL_POLICY_V1);
+  try {
+    const egg = legacy.backend.claimRankedEgg(wallet, { familyId: "pulse", lampPosition: -80 });
+    const started = await legacy.backend.startRankedIllumination(wallet, {
+      sessionId: egg.id,
+      lampPosition: 0,
+    });
+    assert.equal(started.session.status, "running");
+    assert.ok(started.session.lockedTraits);
+    legacy.backend.getHardwareTelemetry = async () => {
+      throw new Error("Synthetic offline telemetry");
+    };
+    await assert.rejects(
+      () => legacy.backend.tickRankedSession(wallet, { sessionId: egg.id, lampPosition: 0 }),
+      /Synthetic offline telemetry/,
+    );
+    const stored = JSON.parse(legacy.raw()) as OrderedRankedSession;
+    assert.equal(stored.status, "paused");
+    assert.ok(stored.lockedTraits);
+  } finally {
+    legacy.backend.close();
+  }
+});
+
+function holdJson(origin: string, pathname: string, cookie: string, payload: unknown): {
+  release: () => void;
+  finished: () => boolean;
+  done: Promise<{ status: number; data: { session?: OrderedRankedSession; error?: string } }>;
+} {
+  const body = Buffer.from(JSON.stringify(payload));
+  const url = new URL(origin);
+  let settled = false;
+  let released = false;
+  let resolveDone: (value: { status: number; data: { session?: OrderedRankedSession; error?: string } }) => void = () => {};
+  let rejectDone: (error: Error) => void = () => {};
+  const done = new Promise<{ status: number; data: { session?: OrderedRankedSession; error?: string } }>((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+  const req = http.request(
+    {
+      hostname: url.hostname,
+      port: url.port,
+      path: pathname,
+      method: "POST",
+      headers: {
+        host: url.host,
+        origin,
+        cookie,
+        "content-type": "application/json",
+        "content-length": String(body.length),
+        connection: "close",
+      },
+    },
+    (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        settled = true;
+        const text = Buffer.concat(chunks).toString("utf8");
+        const data = text ? (JSON.parse(text) as { session?: OrderedRankedSession; error?: string }) : {};
+        resolveDone({ status: res.statusCode ?? 0, data });
+      });
+    },
+  );
+  req.setTimeout(10000, () => req.destroy(new Error(`timed out held ${pathname}`)));
+  req.on("error", (error) => {
+    settled = true;
+    rejectDone(error instanceof Error ? error : new Error(String(error)));
+  });
+  req.flushHeaders();
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      req.end(body);
+    },
+    finished: () => settled,
+    done,
+  };
+}

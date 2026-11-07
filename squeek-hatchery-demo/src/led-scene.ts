@@ -3,7 +3,7 @@
  * Pure where possible so Node regressions can exercise real layout inputs.
  */
 import { LED_GRID, LED_PRESENTATION, regionWeights } from "./led-renderer.ts";
-import { STAGE, clamp, lampGeometry, regionAt } from "./rules.ts";
+import { STAGE, clamp, regionAt } from "./rules.ts";
 
 export interface RgbaImage {
   width: number;
@@ -40,6 +40,23 @@ export const SCENE_LED_GRID = Object.freeze({
 export const LAMP_ART_PIVOT = Object.freeze({ u: 0.84, v: 0.5 });
 export const LAMP_ART_BULB = Object.freeze({ u: 0.3, v: 0.5 });
 export const LAMP_ART_STAGE_WIDTH = 108;
+
+/**
+ * One incubation viewport. Egg coordinates stay on the historical stage; the
+ * extra width is only the right-hand rail. Mount height is the aim
+ * (`STAGE.cy + position`), not the ellipse normal, so ±100 stays on the card
+ * when the rail sits clear of the egg. 416 leaves the 108px sprite outside
+ * every family egg and the bulb at least `minBulbGap` scene units away.
+ */
+export const INCUBATION_SCENE = Object.freeze({
+  width: 480,
+  height: 420,
+  railX: 416,
+  railPad: 18,
+  handleSize: 44,
+  hitWidth: 72,
+  minBulbGap: 24,
+});
 
 /** Per-family egg art silhouettes in stage space (pulse / relay pear / prism). */
 const FAMILY_EGG = Object.freeze([
@@ -363,32 +380,84 @@ export function positionForRegionAim(region: 0 | 1 | 2): number {
 }
 
 /**
- * Contact point and extent of the aimed compositor region.
- * Pixel visibility is the regionWeights mask; this frame only aims the beam and level-up pulse.
+ * Lowest band half-height that still reaches the bulb on the scene lattice.
+ * The nearest lamp column is one 6px step left of the bulb. At aim -100 that
+ * column's ray meets the curved shell about 36 scene units off the aim line.
+ * 48 keeps that ray inside the band for every family, including aim -100.
+ */
+const LIGHT_HALF_FLOOR = 48;
+
+function calibrateLightHalfHeight(family: 0 | 1 | 2): number {
+  const step = 4;
+  const ys: number[] = [];
+  let middle = 0;
+  for (let y = 0; y <= STAGE.h; y += step) {
+    for (let x = 0; x <= STAGE.w; x += step) {
+      if (!pointInFamilyEgg(family, x, y)) continue;
+      ys.push(y);
+      const master = stageToMaster(x, y);
+      if (majorAnatomicalRegion(master.x, master.y) === 1) middle += 1;
+    }
+  }
+  const target = middle > 0 ? middle * 2 : Math.round(ys.length * 0.25);
+  const cap = FAMILY_EGG[family].ry * 0.5;
+  let best = LIGHT_HALF_FLOOR;
+  let bestGap = Number.POSITIVE_INFINITY;
+  for (let half = LIGHT_HALF_FLOOR; half <= cap; half += 1) {
+    let shown = 0;
+    for (const y of ys) {
+      if (Math.abs(y - STAGE.cy) <= half) shown += 1;
+    }
+    if (shown > ys.length * 0.5) break;
+    const gap = Math.abs(shown - target);
+    if (gap < bestGap) {
+      bestGap = gap;
+      best = half;
+    }
+  }
+  return best;
+}
+
+/** One half-height per family. The aim line slides; the height does not jump. */
+const LIGHT_HALF_HEIGHT: readonly [number, number, number] = [
+  calibrateLightHalfHeight(0),
+  calibrateLightHalfHeight(1),
+  calibrateLightHalfHeight(2),
+];
+
+function lightAimY(lampPosition: number): number {
+  return STAGE.cy + clamp(lampPosition, -100, 100);
+}
+
+/**
+ * Scoring-band label plus the continuous light window.
+ * `region` is only the unchanged growth band. The window center is the lamp
+ * height, so -33 and -36 differ by 3 scene units instead of swapping masks.
  */
 export function computeRevealWindow(
   lampPosition: number,
   open: boolean,
   _egg = EGG_SILHOUETTE,
 ): RevealWindow {
-  const region = regionAt(lampPosition) as 0 | 1 | 2;
-  const anchor = stageRegionAnchor(region);
+  const position = clamp(lampPosition, -100, 100);
+  const region = regionAt(position) as 0 | 1 | 2;
+  const cy = lightAimY(position);
   if (!open) {
-    return { cx: anchor.cx, cy: anchor.cy, rx: 0, ry: 0, open: false, region };
+    return { cx: STAGE.cx, cy, rx: 0, ry: 0, open: false, region };
   }
   return {
-    cx: anchor.cx,
-    cy: anchor.cy,
-    rx: anchor.rx,
-    ry: anchor.ry,
+    cx: STAGE.cx,
+    cy,
+    rx: STAGE.rx,
+    ry: LIGHT_HALF_HEIGHT[0],
     open: true,
     region,
   };
 }
 
 /**
- * Fraction of this family's in-egg compositor region that the live opening shows.
- * Samples the same master domain as LedPortraitAdapter._drawCore.
+ * Overlap between the continuous opening and one scoring region's anatomy.
+ * Not the visual contract: light may cross a scoring boundary.
  */
 export function regionRevealCoverageRatio(
   lampPosition: number,
@@ -419,7 +488,12 @@ export function regionRevealCoverageRatio(
   return regionPts === 0 ? 0 : covered / regionPts;
 }
 
-/** Aimed compositor region, and only that region, is visible inside the family egg. */
+/**
+ * Character pixels are the light band intersected with this family's egg.
+ * The band is centered on the lamp height and keeps one half-height, so it
+ * slides through a scoring band and across ±33 without swapping masks.
+ * Shell is the egg outside that band. The beam uses this same test.
+ */
 export function interiorVisibleAt(
   family: 0 | 1 | 2,
   x: number,
@@ -427,10 +501,8 @@ export function interiorVisibleAt(
   open: boolean,
   lampPosition: number,
 ): boolean {
-  if (!open) return false;
-  if (!pointInFamilyEgg(family, x, y)) return false;
-  const master = stageToMaster(x, y);
-  return majorAnatomicalRegion(master.x, master.y) === (regionAt(lampPosition) as 0 | 1 | 2);
+  if (!open || !pointInFamilyEgg(family, x, y)) return false;
+  return Math.abs(y - lightAimY(lampPosition)) <= LIGHT_HALF_HEIGHT[family];
 }
 
 /** Shell dots exist only on the silhouette. The reveal opening removes them. */
@@ -446,22 +518,73 @@ export function shellDotVisibleAt(
   return true;
 }
 
-export function computeLampMountLayout(lampPosition: number, railX = 372): LampMountLayout {
-  const g = lampGeometry(lampPosition, railX);
-  const rad = (g.angle * Math.PI) / 180;
+/**
+ * Vertical rail in the incubation scene. The mount shares the aim height so
+ * drag, keyboard and the handle stay inside the card across -100..100.
+ * Art points at the egg along that horizontal; the beam flare is separate.
+ */
+export function computeLampMountLayout(lampPosition: number, railX = INCUBATION_SCENE.railX): LampMountLayout {
+  const position = Math.max(-100, Math.min(100, lampPosition));
+  const sourceY = STAGE.cy + position;
+  const dy = sourceY - STAGE.cy;
+  const targetX = STAGE.cx + STAGE.rx * Math.sqrt(Math.max(0, 1 - (dy / STAGE.ry) ** 2));
+  const targetY = sourceY;
+  const dx = targetX - railX;
+  const len = Math.hypot(dx, 0) || 1;
+  const ux = dx / len;
   const bulbReach = (LAMP_ART_PIVOT.u - LAMP_ART_BULB.u) * LAMP_ART_STAGE_WIDTH;
   return {
     railX,
-    sourceX: g.sourceX,
-    sourceY: g.sourceY,
-    targetX: g.targetX,
-    targetY: g.targetY,
-    angle: g.angle,
-    bulbX: g.sourceX + Math.cos(rad) * bulbReach,
-    bulbY: g.sourceY + Math.sin(rad) * bulbReach,
-    handleX: g.sourceX,
-    handleY: g.sourceY,
-    handleSize: 44,
+    sourceX: railX,
+    sourceY,
+    targetX,
+    targetY,
+    angle: (Math.atan2(0, ux) * 180) / Math.PI,
+    bulbX: railX + ux * bulbReach,
+    bulbY: sourceY,
+    handleX: railX,
+    handleY: sourceY,
+    handleSize: INCUBATION_SCENE.handleSize,
+  };
+}
+
+/** Inverse of the scene rail: aim height maps back to -100..100. */
+export function positionForSceneRailY(y: number): number {
+  if (!Number.isFinite(y)) return 0;
+  const raw = Math.max(-100, Math.min(100, y - STAGE.cy));
+  return Math.round(raw * 10) / 10;
+}
+
+export function sceneRailSpan(): { x: number; y1: number; y2: number } {
+  return {
+    x: INCUBATION_SCENE.railX,
+    y1: STAGE.cy - 100 - INCUBATION_SCENE.railPad,
+    y2: STAGE.cy + 100 + INCUBATION_SCENE.railPad,
+  };
+}
+
+/** Rail line plus the hit strip. Both use the scene viewport, not the card edge. */
+export function sceneRailGeometry(layout: LampMountLayout): {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  hitX: number;
+  hitY: number;
+  hitW: number;
+  hitH: number;
+} {
+  const span = sceneRailSpan();
+  const hitW = INCUBATION_SCENE.hitWidth;
+  return {
+    x1: layout.railX,
+    y1: span.y1,
+    x2: layout.railX,
+    y2: span.y2,
+    hitX: layout.railX - hitW / 2,
+    hitY: span.y1,
+    hitW,
+    hitH: span.y2 - span.y1,
   };
 }
 
@@ -480,6 +603,42 @@ export function lampAnchorsMatch(layout: LampMountLayout): boolean {
   return bulbToTarget < mountToTarget;
 }
 
+/** Inverse of stagePointToLampImage. `imageAspect` is image height / width. */
+export function lampArtStagePoint(
+  u: number,
+  v: number,
+  layout: LampMountLayout,
+  imageAspect = 1,
+): ScenePoint {
+  const render = (layout.angle * Math.PI) / 180 - Math.PI;
+  const cos = Math.cos(render);
+  const sin = Math.sin(render);
+  const localX = (u - LAMP_ART_PIVOT.u) * LAMP_ART_STAGE_WIDTH;
+  const localY = (v - LAMP_ART_PIVOT.v) * LAMP_ART_STAGE_WIDTH * imageAspect;
+  return {
+    x: layout.sourceX + localX * cos - localY * sin,
+    y: layout.sourceY + localX * sin + localY * cos,
+  };
+}
+
+/** Scene bounds that contain the horizontal lamp sprite, including a tall image. */
+export function lampArtSampleBounds(layout: LampMountLayout): {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+} {
+  const left = layout.sourceX - LAMP_ART_PIVOT.u * LAMP_ART_STAGE_WIDTH;
+  const right = layout.sourceX + (1 - LAMP_ART_PIVOT.u) * LAMP_ART_STAGE_WIDTH;
+  const pad = SCENE_LED_GRID.step;
+  return {
+    minX: left - pad,
+    minY: 0,
+    maxX: Math.min(INCUBATION_SCENE.width, right + pad),
+    maxY: INCUBATION_SCENE.height,
+  };
+}
+
 export function stagePointToLampImage(
   stageX: number,
   stageY: number,
@@ -496,8 +655,15 @@ export function stagePointToLampImage(
   const dy = (stageY - layout.sourceY) / scale;
   const localX = dx * cos + dy * sin;
   const localY = -dx * sin + dy * cos;
-  const imageX = localX + LAMP_ART_PIVOT.u * imageWidth;
-  const imageY = localY + LAMP_ART_PIVOT.v * imageHeight;
+  let imageX = localX + LAMP_ART_PIVOT.u * imageWidth;
+  let imageY = localY + LAMP_ART_PIVOT.v * imageHeight;
+  // Half-open pixel domain [0, width) × [0, height). Noise just below 0 is the
+  // inclusive origin. A forward map that lands on or past the far edge stays
+  // outside; it is never folded back into the last pixel.
+  const originNoise = 1e-4;
+  if (!Number.isFinite(imageX) || !Number.isFinite(imageY)) return null;
+  if (imageX < 0 && imageX >= -originNoise) imageX = 0;
+  if (imageY < 0 && imageY >= -originNoise) imageY = 0;
   if (imageX < 0 || imageY < 0 || imageX >= imageWidth || imageY >= imageHeight) return null;
   return { x: imageX, y: imageY };
 }
@@ -651,6 +817,43 @@ export function sampleLedDotsFromImageData(
   return dots;
 }
 
+/**
+ * True when the segment from the bulb through this outside point enters the
+ * live footprint at the shell, before the point itself.
+ */
+function beamReachesFootprint(
+  originX: number,
+  originY: number,
+  x: number,
+  y: number,
+  family: 0 | 1 | 2,
+  lampPosition: number,
+): boolean {
+  const dx = x - originX;
+  const dy = y - originY;
+  const dist = Math.hypot(dx, dy);
+  if (!(dist > 0.5) || dx >= -0.25) return false;
+  const ux = dx / dist;
+  const uy = dy / dist;
+  let entry = -1;
+  for (let t = 1; t <= 540; t += 2) {
+    const px = originX + ux * t;
+    const py = originY + uy * t;
+    const inside = pointInFamilyEgg(family, px, py);
+    if (!inside) {
+      if (entry >= 0) return false;
+      continue;
+    }
+    if (entry < 0) {
+      entry = t;
+      if (!(dist < entry - 0.5)) return false;
+    }
+    if (interiorVisibleAt(family, px, py, true, lampPosition)) return true;
+    if (t > entry + SCENE_LED_GRID.step) return false;
+  }
+  return false;
+}
+
 /** Warm LED beam and spot on the shared scene lattice. No smooth cone. */
 export function sampleLedBeamDots(
   layout: LampMountLayout,
@@ -659,45 +862,31 @@ export function sampleLedBeamDots(
   power: number,
   family: 0 | 1 | 2 = 0,
 ): { x: number; y: number; r: number; g: number; b: number; a: number }[] {
-  if (!open || power <= 0) return [];
-  const reveal = computeRevealWindow(lampPosition, true);
-  const dots: { x: number; y: number; r: number; g: number; b: number; a: number }[] = [];
+  if (!open || !(power > 0)) return [];
   const intensity = 0.35 + 0.55 * clamp(power, 0, 1);
-  const x0 = layout.bulbX;
-  const y0 = layout.bulbY;
-  const x1 = reveal.cx;
-  const y1 = reveal.cy;
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len = Math.hypot(dx, dy) || 1;
-  const ux = dx / len;
-  const uy = dy / len;
-  const egg = FAMILY_EGG[family]!;
-  const minX = Math.min(x0, egg.cx - egg.rx) - SCENE_LED_GRID.step;
-  const maxX = Math.max(x0, egg.cx + egg.rx) + SCENE_LED_GRID.step;
-  const minY = Math.min(y0, egg.cy - egg.ry) - SCENE_LED_GRID.step;
-  const maxY = Math.max(y0, egg.cy + egg.ry) + SCENE_LED_GRID.step;
-
-  forEachSceneLed({ minX, minY, maxX, maxY }, (x, y) => {
-    const along = ((x - x0) * ux + (y - y0) * uy) / len;
-    const lateral = Math.abs((x - x0) * -uy + (y - y0) * ux);
-    const half = 4 + clamp(along, 0, 1) * Math.max(reveal.rx, reveal.ry) * 0.55;
-    const inCorridor = along >= -0.05 && along <= 1.02 && lateral <= half;
-    const inSpot = interiorVisibleAt(family, x, y, true, lampPosition);
-    if (pointInFamilyEgg(family, x, y)) {
-      if (!inSpot) return;
-    } else if (!inCorridor || along > 0.72) {
-      return;
-    }
-    const radial = Math.hypot(
-      (x - reveal.cx) / Math.max(reveal.rx, 1),
-      (y - reveal.cy) / Math.max(reveal.ry, 1),
-    );
-    const edge = inSpot ? 1 - 0.22 * clamp(radial, 0, 1) : 1 - lateral / half;
-    const a = intensity * clamp(edge, 0, 1) * (inSpot ? 0.72 : 0.48);
-    if (a < 0.08) return;
-    dots.push({ x, y, r: inSpot ? 253 : 251, g: inSpot ? 224 : 191, b: inSpot ? 71 : 36, a });
+  const spotA = intensity * 0.72;
+  const beamA = intensity * 0.48;
+  const dots: { x: number; y: number; r: number; g: number; b: number; a: number }[] = [];
+  forEachSceneLed({ minX: 0, minY: 0, maxX: STAGE.w, maxY: STAGE.h }, (x, y) => {
+    if (!interiorVisibleAt(family, x, y, true, lampPosition)) return;
+    dots.push({ x, y, r: 253, g: 224, b: 71, a: spotA });
   });
+  const aimY = lightAimY(lampPosition);
+  const half = LIGHT_HALF_HEIGHT[family];
+  const pad = SCENE_LED_GRID.step;
+  forEachSceneLed(
+    {
+      minX: layout.bulbX - 110,
+      minY: aimY - half - pad,
+      maxX: layout.bulbX - 0.01,
+      maxY: aimY + half + pad,
+    },
+    (x, y) => {
+      if (pointInFamilyEgg(family, x, y)) return;
+      if (!beamReachesFootprint(layout.bulbX, layout.bulbY, x, y, family, lampPosition)) return;
+      dots.push({ x, y, r: 251, g: 191, b: 36, a: beamA });
+    },
+  );
   return dots;
 }
 

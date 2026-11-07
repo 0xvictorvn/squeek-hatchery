@@ -55,6 +55,14 @@ export interface LedRegionState {
   level: number;
 }
 
+/** Server-owned Ranked attempt order. Legacy rows omit it; clients cannot assign the revision. */
+export interface RankedIntentOrder {
+  attemptId: string;
+  aimIntent: number;
+  revision: number;
+  adopted: boolean;
+}
+
 export interface LedSession {
   schemaVersion: "squeek-led-session-v1";
   id: string;
@@ -74,6 +82,7 @@ export interface LedSession {
   workDuring: string;
   startedAt: string | null;
   completedAt: string | null;
+  intentOrder?: RankedIntentOrder;
 }
 
 export interface CharacterSnapshot {
@@ -661,6 +670,290 @@ export function shouldApplyRankedSessionResponse(input: {
     input.expectedSessionId &&
     input.responseSessionId &&
     input.expectedSessionId !== input.responseSessionId
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export const STALE_RANKED_INTENT_ERROR = "Stale ranked intent.";
+
+const RANKED_ATTEMPT_ID_RE = /^[A-Za-z0-9-]{8,80}$/;
+const RANKED_AIM_INTENT_MAX = 1_000_000_000;
+
+export type RankedOrderCommand =
+  | { kind: "legacy" }
+  | { kind: "ordered"; attemptId: string; aimIntent: number };
+
+export function readRankedIntentOrder(value: unknown): RankedIntentOrder | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.attemptId !== "string" || !RANKED_ATTEMPT_ID_RE.test(raw.attemptId)) return null;
+  if (
+    typeof raw.aimIntent !== "number" ||
+    !Number.isSafeInteger(raw.aimIntent) ||
+    raw.aimIntent < 0 ||
+    raw.aimIntent > RANKED_AIM_INTENT_MAX
+  ) {
+    return null;
+  }
+  if (typeof raw.revision !== "number" || !Number.isSafeInteger(raw.revision) || raw.revision < 0) return null;
+  if (typeof raw.adopted !== "boolean") return null;
+  return {
+    attemptId: raw.attemptId,
+    aimIntent: raw.aimIntent,
+    revision: raw.revision,
+    adopted: raw.adopted,
+  };
+}
+
+export function rankedAttemptIsStale(order: RankedIntentOrder | null, command: RankedOrderCommand): boolean {
+  if (command.kind !== "ordered" || !order) return false;
+  return order.attemptId !== command.attemptId;
+}
+
+export function rotateRankedIntentOrder(order: RankedIntentOrder | null, nextAttemptId: string): RankedIntentOrder {
+  return {
+    attemptId: nextAttemptId,
+    aimIntent: 0,
+    revision: order?.revision ?? 0,
+    adopted: order?.adopted ?? false,
+  };
+}
+
+export interface RankedLampDecision {
+  order: RankedIntentOrder;
+  lampPosition: number;
+  staleAttempt: boolean;
+}
+
+/**
+ * Accept a newer aim intent, ignore a duplicate or older one, and keep legacy
+ * lamp writes only until the session has adopted ordered intents.
+ * The caller accrues the preceding interval before applying the returned lamp.
+ */
+export function decideRankedLampUpdate(input: {
+  order: RankedIntentOrder | null;
+  command: RankedOrderCommand;
+  currentLamp: number;
+  requestedLamp: number | null;
+  assignAttemptId: () => string;
+}): RankedLampDecision {
+  const existing = input.order ? { ...input.order } : null;
+  if (existing && rankedAttemptIsStale(existing, input.command)) {
+    return { order: existing, lampPosition: input.currentLamp, staleAttempt: true };
+  }
+  const order: RankedIntentOrder = existing ?? {
+    attemptId: input.command.kind === "ordered" ? input.command.attemptId : input.assignAttemptId(),
+    aimIntent: 0,
+    revision: 0,
+    adopted: false,
+  };
+  if (input.requestedLamp === null) {
+    return { order, lampPosition: input.currentLamp, staleAttempt: false };
+  }
+  if (input.command.kind === "legacy") {
+    if (order.adopted) return { order, lampPosition: input.currentLamp, staleAttempt: false };
+    return { order, lampPosition: input.requestedLamp, staleAttempt: false };
+  }
+  if (!order.adopted) {
+    return {
+      order: { ...order, adopted: true, aimIntent: input.command.aimIntent },
+      lampPosition: input.requestedLamp,
+      staleAttempt: false,
+    };
+  }
+  if (input.command.aimIntent <= order.aimIntent) {
+    return { order, lampPosition: input.currentLamp, staleAttempt: false };
+  }
+  return {
+    order: { ...order, aimIntent: input.command.aimIntent },
+    lampPosition: input.requestedLamp,
+    staleAttempt: false,
+  };
+}
+
+export interface RankedClientCursor {
+  sessionId: string | null;
+  attemptId: string | null;
+  confirmedIntent: number;
+  desiredIntent: number;
+  desiredLamp: number | null;
+  confirmedRevision: number;
+  dragging: boolean;
+}
+
+export function createRankedClientCursor(): RankedClientCursor {
+  return {
+    sessionId: null,
+    attemptId: null,
+    confirmedIntent: 0,
+    desiredIntent: 0,
+    desiredLamp: null,
+    confirmedRevision: -1,
+    dragging: false,
+  };
+}
+
+export function cursorFromRankedSession(session: LedSession): RankedClientCursor {
+  const order = readRankedIntentOrder(session.intentOrder);
+  return {
+    sessionId: session.id,
+    attemptId: order?.attemptId ?? null,
+    confirmedIntent: order?.aimIntent ?? 0,
+    desiredIntent: order?.aimIntent ?? 0,
+    desiredLamp: session.lampPosition,
+    confirmedRevision: order?.revision ?? -1,
+    dragging: false,
+  };
+}
+
+export function noteRankedDesiredAim(cursor: RankedClientCursor, lampPosition: number): RankedClientCursor {
+  const lamp = clamp(Math.round(lampPosition), -100, 100);
+  if (cursor.desiredLamp === lamp) return cursor;
+  return { ...cursor, desiredLamp: lamp, desiredIntent: cursor.desiredIntent + 1 };
+}
+
+export interface RankedInstallDecision {
+  apply: boolean;
+  sideEffects: boolean;
+  session: LedSession | null;
+  cursor: RankedClientCursor;
+}
+
+function sessionWithLamp(session: LedSession, lampPosition: number): LedSession {
+  if (session.lampPosition === lampPosition) return session;
+  return { ...session, lampPosition };
+}
+
+/** Reject an older authoritative snapshot before it can roll back a newer or in-progress aim. */
+export function decideRankedSessionInstall(input: {
+  cursor: RankedClientCursor;
+  incoming: LedSession;
+  requestEpoch: number;
+  currentEpoch: number;
+  expectedSessionId: string | null;
+}): RankedInstallDecision {
+  if (
+    !shouldApplyRankedSessionResponse({
+      requestEpoch: input.requestEpoch,
+      currentEpoch: input.currentEpoch,
+      expectedSessionId: input.expectedSessionId,
+      responseSessionId: input.incoming.id,
+    })
+  ) {
+    return { apply: false, sideEffects: false, session: null, cursor: input.cursor };
+  }
+  const cursor = input.cursor;
+  const incoming = input.incoming;
+  if (cursor.sessionId && incoming.id !== cursor.sessionId) {
+    return {
+      apply: true,
+      sideEffects: true,
+      session: incoming,
+      cursor: cursorFromRankedSession(incoming),
+    };
+  }
+  const order = readRankedIntentOrder(incoming.intentOrder);
+  const incomingRevision = order?.revision ?? null;
+  if (
+    cursor.sessionId === incoming.id &&
+    incomingRevision !== null &&
+    cursor.confirmedRevision >= 0 &&
+    incomingRevision <= cursor.confirmedRevision
+  ) {
+    return { apply: false, sideEffects: false, session: null, cursor };
+  }
+  const incomingAttempt = order?.attemptId ?? null;
+  const incomingIntent = order?.aimIntent ?? null;
+  const rotated = Boolean(cursor.attemptId && incomingAttempt && cursor.attemptId !== incomingAttempt);
+  if (rotated && order) {
+    if (cursor.dragging && cursor.desiredLamp !== null) {
+      return {
+        apply: true,
+        sideEffects: true,
+        session: sessionWithLamp(incoming, cursor.desiredLamp),
+        cursor: {
+          sessionId: incoming.id,
+          attemptId: order.attemptId,
+          confirmedIntent: order.aimIntent,
+          desiredIntent: order.aimIntent + 1,
+          desiredLamp: cursor.desiredLamp,
+          confirmedRevision: order.revision,
+          dragging: true,
+        },
+      };
+    }
+    return {
+      apply: true,
+      sideEffects: true,
+      session: incoming,
+      cursor: cursorFromRankedSession(incoming),
+    };
+  }
+  const desiredAhead =
+    cursor.desiredLamp !== null && incomingIntent !== null && cursor.desiredIntent > incomingIntent;
+  const confirmedAhead = incomingIntent !== null && incomingIntent < cursor.confirmedIntent;
+  const keepDesired = cursor.desiredLamp !== null && (cursor.dragging || desiredAhead || confirmedAhead);
+  const session = keepDesired ? sessionWithLamp(incoming, cursor.desiredLamp as number) : incoming;
+  return {
+    apply: true,
+    sideEffects: true,
+    session,
+    cursor: {
+      sessionId: incoming.id,
+      attemptId: incomingAttempt ?? cursor.attemptId,
+      confirmedIntent: Math.max(cursor.confirmedIntent, incomingIntent ?? cursor.confirmedIntent),
+      desiredIntent: keepDesired ? cursor.desiredIntent : (incomingIntent ?? cursor.desiredIntent),
+      desiredLamp: keepDesired ? cursor.desiredLamp : session.lampPosition,
+      confirmedRevision: incomingRevision ?? cursor.confirmedRevision,
+      dragging: cursor.dragging,
+    },
+  };
+}
+
+export function isStaleRankedIntentError(error: unknown): boolean {
+  return error === STALE_RANKED_INTENT_ERROR;
+}
+
+/** A failed request from an older attempt or revision must not reset the healthy one. */
+export function rankedCommandFailureIsCurrent(input: {
+  requestEpoch: number;
+  currentEpoch: number;
+  expectedSessionId: string | null;
+  cursor: RankedClientCursor;
+  capturedAttemptId: string | null;
+  capturedRevision: number;
+  capturedSessionId: string | null;
+}): boolean {
+  if (
+    !shouldApplyRankedSessionResponse({
+      requestEpoch: input.requestEpoch,
+      currentEpoch: input.currentEpoch,
+      expectedSessionId: input.expectedSessionId,
+      responseSessionId: input.expectedSessionId,
+    })
+  ) {
+    return false;
+  }
+  if (
+    input.capturedAttemptId &&
+    input.cursor.attemptId &&
+    input.capturedAttemptId !== input.cursor.attemptId
+  ) {
+    return false;
+  }
+  if (
+    input.capturedSessionId &&
+    input.cursor.sessionId &&
+    input.capturedSessionId !== input.cursor.sessionId
+  ) {
+    return false;
+  }
+  if (
+    input.capturedRevision >= 0 &&
+    input.cursor.confirmedRevision >= 0 &&
+    input.capturedRevision !== input.cursor.confirmedRevision
   ) {
     return false;
   }

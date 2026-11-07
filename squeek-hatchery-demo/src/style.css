@@ -413,7 +413,7 @@ button:disabled {
 .led-canvas-wrap {
   position: relative;
   width: 100%;
-  aspect-ratio: 400 / 420;
+  aspect-ratio: 480 / 420;
   border-radius: var(--radius-md);
   overflow: hidden;
   background: #060911;
@@ -509,10 +509,6 @@ button:disabled {
 
 .rail-hit {
   position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  width: 52px;
   cursor: pointer;
   touch-action: none;
   z-index: 5;
@@ -1482,10 +1478,6 @@ button:disabled {
     grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
     gap: 0.55rem;
   }
-  .lamp-handle {
-    width: 36px;
-    height: 36px;
-  }
 }
 
 @media (max-width: 640px) {
@@ -1546,10 +1538,6 @@ button:disabled {
   .led-nav-link {
     padding: 0.35rem 0.5rem;
     font-size: 0.82rem;
-  }
-  .lamp-handle {
-    width: 32px;
-    height: 32px;
   }
 }
 

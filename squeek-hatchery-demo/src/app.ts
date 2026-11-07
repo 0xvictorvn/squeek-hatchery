@@ -30,17 +30,33 @@ import {
 } from "./game-policy.ts";
 import { LedPortraitAdapter, type LedRenderState } from "./led-renderer.ts";
 import {
+  browserPreviewScheduler,
+  createScheduledPreviewGallery,
+  leaderboardResponseIsCurrent,
+  planLeaderboardPortraits,
+  portraitVisualKey,
+  shouldDrawPortrait,
+  shouldResumeAccessoryAnimation,
+  syncStableControlHost,
+  type StableControlSpec,
+} from "./ui-render-cache.ts";
+import {
   buildCharacterSnapshot,
   buildLedMetadataJson,
   clearAttemptProgressKeepingEgg,
   createClientTelemetryTracker,
   createLedSession,
+  createRankedClientCursor,
+  decideRankedSessionInstall,
   formatEffectivePlayerName,
   getStageRenderStateForSession,
+  isStaleRankedIntentError,
   levelUpAnnouncementKey,
   lockSessionTraits,
+  noteRankedDesiredAim,
   playModeAllowsRankedMutation,
   rankedAbandonOnNewEggAllowed,
+  rankedCommandFailureIsCurrent,
   rankedSessionMutationAllowed,
   shouldApplyRankedSessionResponse,
   shortWalletAddress,
@@ -49,6 +65,7 @@ import {
   validatePlayerDisplayName,
   type CharacterSnapshot,
   type LedSession,
+  type RankedClientCursor,
 } from "./led-session.ts";
 import {
   accountPopoverStyle,
@@ -56,14 +73,19 @@ import {
   eggArtDestination,
   forEachSceneLed,
   incubationControlsVisible,
+  INCUBATION_SCENE,
   interiorPixelsOpen,
   interiorVisibleAt,
+  lampArtSampleBounds,
   paintLedDots,
   pointInFamilyEgg,
   positionForRegionAim,
+  positionForSceneRailY,
   presentationForStage,
   sampleLedBeamDots,
   SCENE_LED_GRID,
+  sceneRailGeometry,
+  sceneRailSpan,
   shellDotVisibleAt,
   stageCanvasClipPath,
   stagePointToLampImage,
@@ -74,7 +96,6 @@ import {
 import {
   clamp,
   measurementDayKey,
-  positionForRailY,
   regionAt,
   type Reading,
 } from "./rules.ts";
@@ -191,6 +212,258 @@ function policyForSession(session: Pick<LedSession, "policyVersion">): GamePolic
   return resolveKnownGamePolicy(session.policyVersion) ?? DEFAULT_GAME_POLICY;
 }
 
+/* RANKED_DISPLAY_CLOCK_START */
+// Presentation-only Ranked timer. acceptedElapsed stores the server sample.
+// anchorElapsed plus anchorMonoMs is the carried presentation origin, so a lower
+// late sample does not freeze the readout. Local steps do not move that origin.
+export const RANKED_DISPLAY_MAX_SECONDS = 60;
+
+export type RankedDisplayFreeze =
+  | "egg"
+  | "reset"
+  | "completed"
+  | "interrupted"
+  | "recovery"
+  | "stale-telemetry"
+  | "non-play"
+  | "hidden";
+
+export interface RankedDisplayClock {
+  sessionId: string | null;
+  generation: number | null;
+  /** Last accepted server elapsed. Local steps do not change this. */
+  acceptedElapsed: number;
+  /** Presentation origin. Independent of a lower acceptedElapsed. */
+  anchorElapsed: number;
+  /** performance.now() when anchorElapsed was set. */
+  anchorMonoMs: number;
+  /** Highest seconds already shown for this attempt. */
+  presented: number;
+  advancing: boolean;
+  hold: RankedDisplayFreeze | null;
+}
+
+export interface RankedDisplayAnchorInput {
+  clock: RankedDisplayClock;
+  responseGeneration: number;
+  liveGeneration: number;
+  sessionId: string;
+  serverElapsed: number;
+  nowMonoMs: number;
+  durationSeconds: number;
+  advancing: boolean;
+  hold?: RankedDisplayFreeze | null;
+}
+
+export interface RankedDisplayLiveState {
+  nowMonoMs: number;
+  durationSeconds: number;
+  liveGeneration: number;
+  sessionId: string | null;
+  serverElapsed: number;
+  status: "egg" | "running" | "paused" | "completed";
+  telemetryHealthy: boolean;
+  recovering: boolean;
+  route: "play" | "other";
+  hidden: boolean;
+}
+
+const RANKED_DISPLAY_RESET_REASONS: readonly RankedDisplayFreeze[] = [
+  "egg",
+  "reset",
+  "interrupted",
+];
+
+export function createRankedDisplayClock(): RankedDisplayClock {
+  return {
+    sessionId: null,
+    generation: null,
+    acceptedElapsed: 0,
+    anchorElapsed: 0,
+    anchorMonoMs: 0,
+    presented: 0,
+    advancing: false,
+    hold: null,
+  };
+}
+
+function rankedDisplayCap(durationSeconds: number): { label: number; cap: number } {
+  const label =
+    Number.isFinite(durationSeconds) && durationSeconds > 0
+      ? durationSeconds
+      : RANKED_DISPLAY_MAX_SECONDS;
+  return { label, cap: Math.min(RANKED_DISPLAY_MAX_SECONDS, label) };
+}
+
+function clampRankedDisplaySeconds(value: number, cap: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  if (value >= cap) return cap;
+  return value;
+}
+
+export function projectRankedDisplay(
+  clock: RankedDisplayClock,
+  nowMonoMs: number,
+  durationSeconds: number,
+): number {
+  const { cap } = rankedDisplayCap(durationSeconds);
+  const presented = clampRankedDisplaySeconds(clock.presented, cap);
+  if (!clock.advancing || clock.generation === null || clock.sessionId === null) {
+    return presented;
+  }
+  const delta = nowMonoMs - clock.anchorMonoMs;
+  const extra = Number.isFinite(delta) && delta > 0 ? delta / 1000 : 0;
+  const origin = clampRankedDisplaySeconds(
+    Number.isFinite(clock.anchorElapsed) ? clock.anchorElapsed : presented,
+    cap,
+  );
+  return clampRankedDisplaySeconds(Math.max(presented, origin + extra), cap);
+}
+
+export function anchorRankedDisplayClock(input: RankedDisplayAnchorInput): RankedDisplayClock {
+  if (
+    !Number.isFinite(input.responseGeneration) ||
+    !Number.isFinite(input.liveGeneration) ||
+    input.responseGeneration !== input.liveGeneration ||
+    input.sessionId.length === 0
+  ) {
+    return input.clock;
+  }
+  const { cap } = rankedDisplayCap(input.durationSeconds);
+  const accepted = clampRankedDisplaySeconds(input.serverElapsed, cap);
+  const now = Number.isFinite(input.nowMonoMs) ? input.nowMonoMs : 0;
+  const sameAttempt =
+    input.clock.sessionId === input.sessionId &&
+    input.clock.generation === input.liveGeneration;
+  const carried = sameAttempt
+    ? projectRankedDisplay(input.clock, now, input.durationSeconds)
+    : 0;
+  const presented = clampRankedDisplaySeconds(Math.max(carried, accepted), cap);
+  const advancing = Boolean(input.advancing) && presented + 1e-9 < cap;
+  return {
+    sessionId: input.sessionId,
+    generation: input.liveGeneration,
+    acceptedElapsed: accepted,
+    anchorElapsed: presented,
+    anchorMonoMs: now,
+    presented,
+    advancing,
+    hold: advancing ? null : input.hold ?? null,
+  };
+}
+
+export function freezeRankedDisplayClock(
+  clock: RankedDisplayClock,
+  nowMonoMs: number,
+  durationSeconds: number,
+  reason: RankedDisplayFreeze,
+): RankedDisplayClock {
+  if (RANKED_DISPLAY_RESET_REASONS.includes(reason)) return createRankedDisplayClock();
+  const now = Number.isFinite(nowMonoMs) ? nowMonoMs : 0;
+  const presented = projectRankedDisplay(clock, now, durationSeconds);
+  return {
+    sessionId: clock.sessionId,
+    generation: clock.generation,
+    acceptedElapsed: clock.acceptedElapsed,
+    anchorElapsed: presented,
+    anchorMonoMs: now,
+    presented,
+    advancing: false,
+    hold: reason,
+  };
+}
+
+export function reconcileRankedDisplayClock(
+  clock: RankedDisplayClock,
+  live: RankedDisplayLiveState,
+): RankedDisplayClock {
+  const now = Number.isFinite(live.nowMonoMs) ? live.nowMonoMs : 0;
+  if (live.hidden) {
+    if (!clock.advancing) return clock;
+    return freezeRankedDisplayClock(clock, now, live.durationSeconds, "hidden");
+  }
+  if (live.route !== "play") {
+    if (!clock.advancing) return clock;
+    return freezeRankedDisplayClock(clock, now, live.durationSeconds, "non-play");
+  }
+  if (live.status === "egg") return createRankedDisplayClock();
+  if (live.status === "paused" || live.status === "completed") {
+    if (!live.sessionId) return createRankedDisplayClock();
+    const foreign =
+      clock.generation !== null &&
+      (clock.generation !== live.liveGeneration || clock.sessionId !== live.sessionId);
+    if (foreign) return clock.advancing ? { ...clock, advancing: false } : clock;
+    return anchorRankedDisplayClock({
+      clock,
+      responseGeneration: live.liveGeneration,
+      liveGeneration: live.liveGeneration,
+      sessionId: live.sessionId,
+      serverElapsed: live.serverElapsed,
+      nowMonoMs: now,
+      durationSeconds: live.durationSeconds,
+      advancing: false,
+      hold: "completed",
+    });
+  }
+  if (!live.telemetryHealthy) {
+    if (!clock.advancing) {
+      return clock.hold === "stale-telemetry" ? clock : { ...clock, hold: "stale-telemetry" };
+    }
+    return freezeRankedDisplayClock(clock, now, live.durationSeconds, "stale-telemetry");
+  }
+  if (live.recovering) {
+    if (!clock.advancing) {
+      return clock.hold === "recovery" ? clock : { ...clock, hold: "recovery" };
+    }
+    return freezeRankedDisplayClock(clock, now, live.durationSeconds, "recovery");
+  }
+  if (
+    !live.sessionId ||
+    clock.generation === null ||
+    clock.sessionId !== live.sessionId ||
+    clock.generation !== live.liveGeneration
+  ) {
+    if (!clock.advancing) return clock;
+    return { ...clock, advancing: false };
+  }
+  if (!clock.advancing && (clock.hold === "hidden" || clock.hold === "non-play")) {
+    const { cap } = rankedDisplayCap(live.durationSeconds);
+    const accepted = clampRankedDisplaySeconds(live.serverElapsed, cap);
+    const base = clampRankedDisplaySeconds(Math.max(clock.presented, accepted), cap);
+    return {
+      sessionId: clock.sessionId,
+      generation: clock.generation,
+      acceptedElapsed: accepted,
+      anchorElapsed: base,
+      anchorMonoMs: now,
+      presented: base,
+      advancing: base + 1e-9 < cap,
+      hold: null,
+    };
+  }
+  if (!clock.advancing) return clock;
+  const seconds = projectRankedDisplay(clock, now, live.durationSeconds);
+  const { cap } = rankedDisplayCap(live.durationSeconds);
+  const atCap = seconds + 1e-9 >= cap;
+  return {
+    ...clock,
+    presented: seconds,
+    advancing: !atCap,
+    hold: null,
+  };
+}
+
+export function formatRankedTimerReadout(seconds: number, durationSeconds: number): string {
+  const { label, cap } = rankedDisplayCap(durationSeconds);
+  let value = clampRankedDisplaySeconds(seconds, cap);
+  if (value + 1e-9 < cap) {
+    const tenth = Number(value.toFixed(1));
+    if (tenth + 1e-9 >= cap) value = Math.max(0, cap - 0.1);
+  }
+  return `${value.toFixed(1)}s / ${label}s`;
+}
+/* RANKED_DISPLAY_CLOCK_END */
+
 export async function mountApp(): Promise<void> {
   const appRoot = document.getElementById("app");
   if (!appRoot) return;
@@ -220,6 +493,8 @@ export async function mountApp(): Promise<void> {
   // Ranked session mirrored from authoritative backend
   let rankedSession: LedSession | null = null;
   let rankedWriteEpoch = 0;
+  let rankedAimCursor: RankedClientCursor = createRankedClientCursor();
+  let rankedDisplayClock = createRankedDisplayClock();
   // Every new document must clear any unfinished attempt before Ranked first light.
   let rankedRecoveryNeeded = true;
   let authRefreshInFlight: Promise<void> | null = null;
@@ -275,6 +550,17 @@ export async function mountApp(): Promise<void> {
   let leaderboardWeekKey = "";
   let leaderboardEntries: LeaderboardEntryDto[] = [];
   let leaderboardLoading = false;
+  let leaderboardFetchGen = 0;
+  let leaderboardViewSignature = "";
+  let leaderboardPlaceholderReady = false;
+  let stagePortraitKey: string | null = null;
+  let nftPortraitKey: string | null = null;
+  let nftDrawToken = 0;
+  let nftDetailRequestGen = 0;
+  const leaderboardPortraits = new Map<
+    string,
+    { adapter: LedPortraitAdapter; canvas: HTMLCanvasElement; visualKey: string }
+  >();
   let nftDetailLoading = false;
   let nftDetailError: string | null = null;
   let nftDetailData: {
@@ -296,6 +582,8 @@ export async function mountApp(): Promise<void> {
     EXPERIMENTAL_POLICY_V2,
     DEFAULT_BACKGROUND_CALIBRATION_PROFILE,
   );
+
+  const initialRail = sceneRailSpan();
 
   // ---------- DOM Skeleton ----------
   appRoot.innerHTML = `
@@ -385,8 +673,8 @@ export async function mountApp(): Promise<void> {
             <div class="led-stage-Interactive">
               <div class="led-canvas-wrap" id="stage-canvas-wrap">
                 <canvas id="led-stage-canvas" width="1600" height="1600" aria-label="1600 by 1600 LED Hamster Portrait"></canvas>
-                <canvas id="led-scene-fx" width="400" height="420" aria-hidden="true"></canvas>
-                <svg id="stage-svg" viewBox="0 0 400 420" class="led-stage-svg" aria-hidden="true">
+                <canvas id="led-scene-fx" width="${INCUBATION_SCENE.width}" height="${INCUBATION_SCENE.height}" aria-hidden="true"></canvas>
+                <svg id="stage-svg" viewBox="0 0 ${INCUBATION_SCENE.width} ${INCUBATION_SCENE.height}" class="led-stage-svg" aria-hidden="true">
                   <defs>
                     <clipPath id="eggInterior">
                       <ellipse cx="200" cy="215" rx="118" ry="152" />
@@ -394,7 +682,7 @@ export async function mountApp(): Promise<void> {
                   </defs>
                   <g id="shell"></g>
                   <g id="beam-layer" class="led-beam-layer" style="opacity: 0;"></g>
-                  <line id="lamp-rail" x1="372" y1="36" x2="372" y2="388" stroke="#8a7360" stroke-width="5" stroke-linecap="round"/>
+                  <line id="lamp-rail" x1="${initialRail.x}" y1="${initialRail.y1}" x2="${initialRail.x}" y2="${initialRail.y2}" stroke="#8a7360" stroke-width="5" stroke-linecap="round"/>
                   <g id="lamp-art"></g>
                 </svg>
                 <div id="lamp-handle-elem" class="lamp-handle" role="slider" tabindex="0" aria-label="Aim heat lamp height. Arrow keys move across Head, Body and Chest, and Belly and Tail." aria-orientation="vertical" aria-valuemin="-100" aria-valuemax="100" aria-valuenow="-70"></div>
@@ -584,6 +872,34 @@ export async function mountApp(): Promise<void> {
   const nftAdapter = new LedPortraitAdapter(nftDetailCanvas, {
     basePath: LAB_ASSETS_BASE_URL,
   });
+  type DocsPreviewRecord = {
+    state: LedRenderState;
+    canvas: HTMLCanvasElement;
+    adapter: LedPortraitAdapter | null;
+  };
+  const docsRecords = new Map<string, DocsPreviewRecord>();
+  let docsCatalogReady = false;
+  const docsGallery = createScheduledPreviewGallery(browserPreviewScheduler, {
+    prepare(preview) {
+      const record = docsRecords.get(preview.id);
+      if (!record) return;
+      if (!record.adapter) {
+        record.adapter = new LedPortraitAdapter(record.canvas, {
+          basePath: LAB_ASSETS_BASE_URL,
+          size: 140,
+        });
+      }
+      return record.adapter.load().then(() => undefined);
+    },
+    paint(preview) {
+      const record = docsRecords.get(preview.id);
+      if (!record?.adapter) return;
+      record.adapter.draw(record.state, { staticOnly: true });
+    },
+    stop(preview) {
+      docsRecords.get(preview.id)?.adapter?.stopAnimation();
+    },
+  });
 
   await stageAdapter.load().catch(() => {
     // Adapter handles missing asset recovery gracefully
@@ -625,10 +941,10 @@ export async function mountApp(): Promise<void> {
       const anchor = stageRegionAnchor(region);
       pulse.hidden = false;
       pulse.className = prefersReducedMotion() ? "region-led-pulse" : "region-led-pulse is-live";
-      pulse.style.left = `${(anchor.cx / 400) * 100}%`;
-      pulse.style.top = `${(anchor.cy / 420) * 100}%`;
-      pulse.style.width = `${((anchor.rx * 2) / 400) * 100}%`;
-      pulse.style.height = `${((anchor.ry * 2) / 420) * 100}%`;
+      pulse.style.left = `${(anchor.cx / INCUBATION_SCENE.width) * 100}%`;
+      pulse.style.top = `${(anchor.cy / INCUBATION_SCENE.height) * 100}%`;
+      pulse.style.width = `${((anchor.rx * 2) / INCUBATION_SCENE.width) * 100}%`;
+      pulse.style.height = `${((anchor.ry * 2) / INCUBATION_SCENE.height) * 100}%`;
       if (!prefersReducedMotion()) {
         pulse.classList.remove("is-live");
         void pulse.offsetWidth;
@@ -657,8 +973,18 @@ export async function mountApp(): Promise<void> {
     }
   }
 
-  function captureRankedWrite(): { epoch: number; sessionId: string | null } {
-    return { epoch: rankedWriteEpoch, sessionId: rankedSession?.id ?? null };
+  function captureRankedWrite(): {
+    epoch: number;
+    sessionId: string | null;
+    attemptId: string | null;
+    revision: number;
+  } {
+    return {
+      epoch: rankedWriteEpoch,
+      sessionId: rankedSession?.id ?? null,
+      attemptId: rankedAimCursor.attemptId,
+      revision: rankedAimCursor.confirmedRevision,
+    };
   }
 
   function forgetLevelUps(sessionId: string): void {
@@ -670,7 +996,56 @@ export async function mountApp(): Promise<void> {
   function invalidateRankedWrites(): number {
     rankedWriteEpoch += 1;
     announcedLevelUps.clear();
+    rankedDisplayClock = createRankedDisplayClock();
+    rankedAimCursor = createRankedClientCursor();
     return rankedWriteEpoch;
+  }
+
+  function rankedOrderBody(): { attemptId?: string; aimIntent?: number } {
+    if (!rankedAimCursor.attemptId) return {};
+    return { attemptId: rankedAimCursor.attemptId, aimIntent: rankedAimCursor.desiredIntent };
+  }
+
+  function ignoreRankedFailure(
+    captured: { epoch: number; sessionId: string | null; attemptId: string | null; revision: number },
+    errorText: string | undefined,
+  ): boolean {
+    if (isStaleRankedIntentError(errorText)) return true;
+    return !rankedCommandFailureIsCurrent({
+      requestEpoch: captured.epoch,
+      currentEpoch: rankedWriteEpoch,
+      expectedSessionId: captured.sessionId,
+      cursor: rankedAimCursor,
+      capturedAttemptId: captured.attemptId,
+      capturedRevision: captured.revision,
+      capturedSessionId: captured.sessionId,
+    });
+  }
+
+  function installRankedSession(
+    incoming: LedSession,
+    captured: { epoch: number },
+    expectedSessionId: string | null,
+  ): LedSession | null {
+    if (
+      rankedSession &&
+      rankedSession.status === "completed" &&
+      rankedSession.id === incoming.id &&
+      incoming.status !== "completed"
+    ) {
+      return null;
+    }
+    const decision = decideRankedSessionInstall({
+      cursor: rankedAimCursor,
+      incoming,
+      requestEpoch: captured.epoch,
+      currentEpoch: rankedWriteEpoch,
+      expectedSessionId,
+    });
+    if (!decision.apply || !decision.session || !decision.sideEffects) return null;
+    rankedAimCursor = decision.cursor;
+    rankedSession = decision.session;
+    return rankedSession;
   }
 
   function acceptRankedWrite(
@@ -709,37 +1084,42 @@ export async function mountApp(): Promise<void> {
     return { ...state, family };
   }
 
-  function renderDocsCatalogTables(): void {
+  function syncDocsCatalog(active: boolean): void {
+    if (!active) {
+      docsGallery.hide();
+      return;
+    }
     const host = document.getElementById("docs-catalog-tables");
     if (!host) return;
-    const policy = LATEST_GAME_POLICY;
-    const paletteCards = PALETTES.map((item, index) => {
-      const pts = policy.palettePoints[index] ?? 1;
-      return `<article class="led-docs-preview-card">
+    if (!docsCatalogReady) {
+      const policy = LATEST_GAME_POLICY;
+      const paletteCards = PALETTES.map((item, index) => {
+        const pts = policy.palettePoints[index] ?? 1;
+        return `<article class="led-docs-preview-card">
         <canvas class="led-docs-palette-preview" data-palette-index="${index}" width="140" height="140" role="img" aria-label="${escapeAttr(item.name)} coat palette, ${pts} point${pts === 1 ? "" : "s"}"></canvas>
         <div class="led-docs-preview-name">${escapeText(item.name)}</div>
         <div class="led-docs-preview-pts">${pts} pt${pts === 1 ? "" : "s"}</div>
       </article>`;
-    }).join("");
-    const accessoryCards = LED_ACCESSORIES.map((item, index) => {
-      const pts = policy.accessoryPoints[index] ?? 1;
-      return `<article class="led-docs-preview-card">
+      }).join("");
+      const accessoryCards = LED_ACCESSORIES.map((item, index) => {
+        const pts = policy.accessoryPoints[index] ?? 1;
+        return `<article class="led-docs-preview-card">
         <canvas class="led-docs-acc-preview" data-acc-index="${index}" width="140" height="140" role="img" aria-label="${escapeAttr(item.name)} cyber accessory, ${pts} point${pts === 1 ? "" : "s"}"></canvas>
         <div class="led-docs-preview-name">${escapeText(item.name)}</div>
         <div class="led-docs-preview-pts">${pts} pt${pts === 1 ? "" : "s"}</div>
       </article>`;
-    }).join("");
-    const backgroundCards = LED_BACKGROUNDS.map((item, index) => {
-      const pts = policy.backgroundPoints[index] ?? 1;
-      const src = `${LAB_ASSETS_BASE_URL}${item.file}`;
-      return `<article class="led-docs-preview-card">
+      }).join("");
+      const backgroundCards = LED_BACKGROUNDS.map((item, index) => {
+        const pts = policy.backgroundPoints[index] ?? 1;
+        const src = `${LAB_ASSETS_BASE_URL}${item.file}`;
+        return `<article class="led-docs-preview-card">
         <img src="${escapeAttr(src)}" alt="${escapeAttr(item.name)} LED background, ${pts} point${pts === 1 ? "" : "s"}" width="140" height="140" loading="lazy" decoding="async" />
         <div class="led-docs-preview-name">${escapeText(item.name)}</div>
         <div class="led-docs-preview-pts">${pts} pt${pts === 1 ? "" : "s"}</div>
       </article>`;
-    }).join("");
+      }).join("");
 
-    host.innerHTML = `
+      host.innerHTML = `
       <section class="led-docs-section">
         <h3>Coat Palettes</h3>
         <div class="led-docs-preview-grid">${paletteCards}</div>
@@ -754,38 +1134,37 @@ export async function mountApp(): Promise<void> {
       </section>
     `;
 
-    const paintThumb = (
-      canvas: HTMLCanvasElement,
-      state: LedRenderState,
-    ) => {
-      const thumb = new LedPortraitAdapter(canvas, {
-        basePath: LAB_ASSETS_BASE_URL,
-        size: 140,
+      const previews: { id: string; visualKey: string }[] = [];
+      host.querySelectorAll<HTMLCanvasElement>("canvas.led-docs-palette-preview").forEach((canvas) => {
+        const idx = Number(canvas.dataset.paletteIndex ?? 0);
+        const id = `palette:${idx}`;
+        const state: LedRenderState = {
+          family: 0,
+          levels: [8, 8, 8],
+          palette: idx,
+          accessory: -1,
+          background: -1,
+        };
+        docsRecords.set(id, { state, canvas, adapter: null });
+        previews.push({ id, visualKey: portraitVisualKey({ ...state, staticOnly: true }) });
       });
-      void thumb.load().then(() => {
-        thumb.draw(state, { staticOnly: true });
+      host.querySelectorAll<HTMLCanvasElement>("canvas.led-docs-acc-preview").forEach((canvas) => {
+        const idx = Number(canvas.dataset.accIndex ?? 0);
+        const id = `accessory:${idx}`;
+        const state: LedRenderState = {
+          family: 0,
+          levels: [6, 6, 6],
+          palette: 0,
+          accessory: idx,
+          background: -1,
+        };
+        docsRecords.set(id, { state, canvas, adapter: null });
+        previews.push({ id, visualKey: portraitVisualKey({ ...state, staticOnly: true }) });
       });
-    };
-    host.querySelectorAll<HTMLCanvasElement>("canvas.led-docs-palette-preview").forEach((canvas) => {
-      const idx = Number(canvas.dataset.paletteIndex ?? 0);
-      paintThumb(canvas, {
-        family: 0,
-        levels: [8, 8, 8],
-        palette: idx,
-        accessory: -1,
-        background: -1,
-      });
-    });
-    host.querySelectorAll<HTMLCanvasElement>("canvas.led-docs-acc-preview").forEach((canvas) => {
-      const idx = Number(canvas.dataset.accIndex ?? 0);
-      paintThumb(canvas, {
-        family: 0,
-        levels: [6, 6, 6],
-        palette: 0,
-        accessory: idx,
-        background: -1,
-      });
-    });
+      if (!docsGallery.install(previews)) return;
+      docsCatalogReady = true;
+    }
+    docsGallery.open();
   }
 
   const sceneFxCanvas = document.getElementById("led-scene-fx") as HTMLCanvasElement | null;
@@ -863,13 +1242,16 @@ export async function mountApp(): Promise<void> {
     });
     const presentation = presentationForStage(sess.status);
 
+    const railGeom = sceneRailGeometry(layout);
     const stageSvg = document.getElementById("stage-svg");
     if (stageSvg) {
       stageSvg.setAttribute("data-controls", controlsOn ? "on" : "off");
       const rail = document.getElementById("lamp-rail");
       if (rail) {
-        rail.setAttribute("x1", String(layout.railX));
-        rail.setAttribute("x2", String(layout.railX));
+        rail.setAttribute("x1", String(railGeom.x1));
+        rail.setAttribute("x2", String(railGeom.x2));
+        rail.setAttribute("y1", String(railGeom.y1));
+        rail.setAttribute("y2", String(railGeom.y2));
       }
     }
 
@@ -884,8 +1266,8 @@ export async function mountApp(): Promise<void> {
         lampHandle.hidden = false;
         lampHandle.tabIndex = 0;
         lampHandle.removeAttribute("aria-hidden");
-        lampHandle.style.left = `${(layout.handleX / 400) * 100}%`;
-        lampHandle.style.top = `${(layout.handleY / 420) * 100}%`;
+        lampHandle.style.left = `${(layout.handleX / INCUBATION_SCENE.width) * 100}%`;
+        lampHandle.style.top = `${(layout.handleY / INCUBATION_SCENE.height) * 100}%`;
         lampHandle.style.right = "auto";
         lampHandle.style.width = `${layout.handleSize}px`;
         lampHandle.style.height = `${layout.handleSize}px`;
@@ -896,8 +1278,15 @@ export async function mountApp(): Promise<void> {
       }
     }
     if (railHit) {
-      railHit.hidden = !controlsOn;
-      (railHit as HTMLElement).style.pointerEvents = controlsOn ? "auto" : "none";
+      const hit = railHit as HTMLElement;
+      hit.hidden = !controlsOn;
+      hit.style.pointerEvents = controlsOn ? "auto" : "none";
+      hit.style.left = `${(railGeom.hitX / INCUBATION_SCENE.width) * 100}%`;
+      hit.style.top = `${(railGeom.hitY / INCUBATION_SCENE.height) * 100}%`;
+      hit.style.width = `${(railGeom.hitW / INCUBATION_SCENE.width) * 100}%`;
+      hit.style.height = `${(railGeom.hitH / INCUBATION_SCENE.height) * 100}%`;
+      hit.style.right = "auto";
+      hit.style.bottom = "auto";
     }
 
     if (sceneFxCtx && sceneFxCanvas) {
@@ -941,7 +1330,7 @@ export async function mountApp(): Promise<void> {
         if (controlsOn) {
           const lampImage = sceneArtPixels.get(LAMP_ART_URL);
           if (lampImage) {
-            forEachSceneLed({ minX: 220, minY: 0, maxX: 400, maxY: 420 }, (x, y) => {
+            forEachSceneLed(lampArtSampleBounds(layout), (x, y) => {
               const imagePoint = stagePointToLampImage(
                 x,
                 y,
@@ -965,10 +1354,6 @@ export async function mountApp(): Promise<void> {
   }
 
   function redrawStageCanvas(): void {
-    if (currentRoute.kind !== "play") {
-      stageAdapter.stopAnimation();
-      return;
-    }
     const sess = activeSession();
     const isCompleted = sess.status === "completed";
     const isLit = interiorPixelsOpen({
@@ -986,6 +1371,9 @@ export async function mountApp(): Promise<void> {
     const wrap = document.getElementById("stage-canvas-wrap");
     if (wrap) {
       wrap.classList.toggle("led-portrait-square", isCompleted);
+      wrap.style.aspectRatio = isCompleted
+        ? ""
+        : `${INCUBATION_SCENE.width} / ${INCUBATION_SCENE.height}`;
     }
 
     const state = getPortraitStateForActiveSession();
@@ -995,7 +1383,46 @@ export async function mountApp(): Promise<void> {
     stageCanvas.dataset.stageBackground = String(state.background);
     stageCanvas.dataset.stageLevels = state.levels.join(",");
     stageCanvas.dataset.sessionStatus = sess.status;
-    stageAdapter.draw(state);
+
+    const routeVisible = currentRoute.kind === "play";
+    const canvasFullyHidden = clip.visibility !== "visible" || clip.opacity === "0";
+    const nextKey = portraitVisualKey({
+      family: state.family,
+      regionFamilies: state.regionFamilies,
+      levels: state.levels,
+      palette: state.palette,
+      accessory: state.accessory,
+      background: state.background,
+      staticOnly: false,
+    });
+    const drawPortrait = shouldDrawPortrait({
+      previousKey: stagePortraitKey,
+      nextKey,
+      routeVisible,
+      canvasFullyHidden,
+      pixelsSampledWhileHidden: canvasFullyHidden && isLit && sess.status !== "completed",
+    });
+
+    if (!routeVisible) {
+      stageAdapter.stopAnimation();
+      return;
+    }
+
+    if (drawPortrait) {
+      stageAdapter.draw(state);
+      stagePortraitKey = nextKey;
+    } else if (
+      shouldResumeAccessoryAnimation({
+        previousKey: stagePortraitKey,
+        nextKey,
+        routeVisible,
+        canvasFullyHidden,
+        animating: stageAdapter.status.animating,
+        accessoryAnimates: state.accessory >= 7 && !prefersReducedMotion(),
+      })
+    ) {
+      stageAdapter.resumeAccessoryAnimation();
+    }
     updateLampAndShellVisuals();
   }
 
@@ -1030,6 +1457,7 @@ export async function mountApp(): Promise<void> {
     rankedRecoveryNeeded = true;
     clearAttemptProgressKeepingEgg(rankedSession);
     rankedSnapshot = null;
+    rankedDisplayClock = createRankedDisplayClock();
   }
 
   async function refreshAuthSession(): Promise<void> {
@@ -1068,16 +1496,26 @@ export async function mountApp(): Promise<void> {
           isCurrent: () => current() && activePlayMode === "ranked",
         });
         if (!restored) return;
-        rankedSession = restored.session;
         rankedRecoveryNeeded = false;
         if (restored.allowance) userAllowance = restored.allowance;
-        if (rankedSession) selectedFamilyIndex = rankedSession.familyIndex;
+        if (restored.session) {
+          const installed = installRankedSession(restored.session, { epoch }, null);
+          if (installed) {
+            selectedFamilyIndex = installed.familyIndex;
+            applyAcceptedRankedDisplay(installed, epoch);
+          }
+        } else {
+          rankedSession = null;
+          rankedAimCursor = createRankedClientCursor();
+          rankedDisplayClock = createRankedDisplayClock();
+        }
         eggConfirmed = Boolean(rankedSession && rankedSession.status !== "completed");
       } else {
         authPlayer = null;
         rankedSession = null;
         userAllowance = null;
         rankedRecoveryNeeded = false;
+        rankedDisplayClock = createRankedDisplayClock();
       }
     } catch {
       // Retain identity and the cleared egg while offline; first light remains gated.
@@ -1197,6 +1635,8 @@ export async function mountApp(): Promise<void> {
   }
 
   async function refreshLeaderboard(): Promise<void> {
+    if (currentRoute.kind !== "leaderboard") return;
+    const gen = ++leaderboardFetchGen;
     leaderboardLoading = true;
     renderLeaderboardTables();
     try {
@@ -1205,6 +1645,7 @@ export async function mountApp(): Promise<void> {
         policyVersion: string;
         entries: LeaderboardEntryDto[];
       }>("/api/leaderboard?limit=100");
+      if (!leaderboardResponseIsCurrent(gen, leaderboardFetchGen, currentRoute.kind === "leaderboard")) return;
       if (res.ok) {
         leaderboardWeekKey = res.data.weekKey;
         leaderboardEntries = res.data.entries ?? [];
@@ -1212,16 +1653,22 @@ export async function mountApp(): Promise<void> {
     } catch {
       // ignore
     } finally {
+      if (gen !== leaderboardFetchGen) return;
       leaderboardLoading = false;
-      renderLeaderboardTables();
+      if (currentRoute.kind === "leaderboard") renderLeaderboardTables();
     }
   }
 
   async function loadPublicNftDetail(resultId: string): Promise<void> {
+    const gen = ++nftDetailRequestGen;
+    const stillViewing = () =>
+      gen === nftDetailRequestGen &&
+      currentRoute.kind === "result" &&
+      currentRoute.resultId === resultId;
     nftDetailLoading = true;
     nftDetailError = null;
     nftDetailData = null;
-    renderNftView();
+    if (stillViewing()) renderNftView();
     try {
       const res = await apiFetch<{
         resultId: string;
@@ -1235,16 +1682,19 @@ export async function mountApp(): Promise<void> {
         leaderboardRank: number | null;
         error?: string;
       }>(`/api/results/${encodeURIComponent(resultId)}`);
+      if (!stillViewing()) return;
       if (!res.ok) {
         nftDetailError = res.data?.error || `Result ${resultId} not found (${res.status}).`;
       } else {
         nftDetailData = res.data;
       }
     } catch (err) {
+      if (!stillViewing()) return;
       nftDetailError = err instanceof Error ? err.message : "Failed to load character result.";
     } finally {
+      if (gen !== nftDetailRequestGen) return;
       nftDetailLoading = false;
-      renderNftView();
+      if (currentRoute.kind === "result" && currentRoute.resultId === resultId) renderNftView();
     }
   }
 
@@ -1391,6 +1841,7 @@ export async function mountApp(): Promise<void> {
       const idx = Number(btn.dataset.familyIndex);
       const isMatch = idx === familyIndex;
       btn.classList.toggle("selected", isMatch);
+      btn.classList.toggle("active", isMatch);
       btn.setAttribute("aria-checked", String(isMatch));
     });
     redrawStageCanvas();
@@ -1415,7 +1866,9 @@ export async function mountApp(): Promise<void> {
         showToast("err", claimRes.data.error || "Could not claim ranked egg.");
         return;
       }
-      rankedSession = claimRes.data.session;
+      const claimed = installRankedSession(claimRes.data.session, capturedWrite, null);
+      if (!claimed) return;
+      applyAcceptedRankedDisplay(claimed, capturedWrite.epoch);
       if (claimRes.data.allowance) {
         userAllowance = claimRes.data.allowance;
         renderAuthBar();
@@ -1462,17 +1915,17 @@ export async function mountApp(): Promise<void> {
         body: JSON.stringify({
           sessionId: rankedSession.id,
           lampPosition: rankedSession.lampPosition,
+          ...rankedOrderBody(),
         }),
       }).catch(() => {
-        if (acceptRankedWrite(capturedWrite, capturedWrite.sessionId)) interruptRankedAttempt();
+        if (ignoreRankedFailure(capturedWrite, undefined)) return null;
+        interruptRankedAttempt();
         void refreshAuthSession().then(() => { renderPlayDynamicSections(); redrawStageCanvas(); });
         return null;
       });
       if (!startRes) return;
-      if (!acceptRankedWrite(capturedWrite, startRes.ok ? startRes.data.session.id : capturedWrite.sessionId)) {
-        return;
-      }
       if (!startRes.ok) {
+        if (ignoreRankedFailure(capturedWrite, startRes.data.error)) return;
         interruptRankedAttempt();
         if (startRes.status === 503) {
           telemetryTracker.recordPollFailure(
@@ -1486,7 +1939,8 @@ export async function mountApp(): Promise<void> {
         return;
       }
       const wasLocked = Boolean(rankedSession.lockedTraits);
-      rankedSession = startRes.data.session;
+      const started = installRankedSession(startRes.data.session, capturedWrite, capturedWrite.sessionId);
+      if (!started) return;
       if (startRes.data.reading) {
         telemetryTracker.ingestBackendReading(
           startRes.data.reading,
@@ -1496,10 +1950,11 @@ export async function mountApp(): Promise<void> {
       }
       currentPaletteSchedule = startRes.data.paletteSchedule;
       currentAccessorySchedule = startRes.data.accessorySchedule;
-      if (!wasLocked && rankedSession.lockedTraits) {
+      applyAcceptedRankedDisplay(started, capturedWrite.epoch);
+      if (!wasLocked && started.lockedTraits) {
         showToast(
           "ok",
-          `Locked Coat Palette (${rankedSession.lockedTraits.paletteName}) & Accessory (${rankedSession.lockedTraits.accessoryName}) simultaneously!`,
+          `Locked Coat Palette (${started.lockedTraits.paletteName}) & Accessory (${started.lockedTraits.accessoryName}) simultaneously!`,
         );
       }
     } else {
@@ -1601,18 +2056,22 @@ export async function mountApp(): Promise<void> {
         error?: string;
       }>("/api/session/complete", {
         method: "POST",
-        body: JSON.stringify({ sessionId: rankedSession.id }),
+        body: JSON.stringify({ sessionId: rankedSession.id, ...rankedOrderBody() }),
       });
-      if (!acceptRankedWrite(capturedWrite, capturedWrite.sessionId)) return;
       if (!res.ok) {
+        if (ignoreRankedFailure(capturedWrite, res.data.error)) return;
         showToast("err", res.data.error || "Could not complete ranked session.");
         return;
       }
+      if (!acceptRankedWrite(capturedWrite, capturedWrite.sessionId)) return;
+      const completing = rankedSession;
+      if (!completing || completing.id !== capturedWrite.sessionId) return;
       rankedSnapshot = res.data.snapshot;
       rankedLeaderboardRank = res.data.leaderboardRank;
-      rankedSession.status = "completed";
-      rankedSession.backgroundIndex = res.data.snapshot.backgroundIndex;
-      rankedSession.backgroundId = res.data.snapshot.backgroundId;
+      completing.status = "completed";
+      completing.backgroundIndex = res.data.snapshot.backgroundIndex;
+      completing.backgroundId = res.data.snapshot.backgroundId;
+      applyAcceptedRankedDisplay(completing, capturedWrite.epoch);
       if (res.data.allowance) {
         userAllowance = res.data.allowance;
         renderAuthBar();
@@ -1668,6 +2127,7 @@ export async function mountApp(): Promise<void> {
       rankedSession = null;
       rankedSnapshot = null;
       rankedLeaderboardRank = null;
+      rankedDisplayClock = createRankedDisplayClock();
     }
     guestSession = createLedSession({
       mode: "guest",
@@ -1716,6 +2176,10 @@ export async function mountApp(): Promise<void> {
   async function handleAimLamp(newPosition: number, commitToServer = false): Promise<void> {
     const clampedPos = clamp(Math.round(newPosition), -100, 100);
     const sess = activeSession();
+    if (authPlayer && activePlayMode === "ranked" && rankedSession && sess.id === rankedSession.id) {
+      rankedAimCursor = noteRankedDesiredAim(rankedAimCursor, clampedPos);
+      rankedAimCursor = { ...rankedAimCursor, dragging: !commitToServer };
+    }
     sess.lampPosition = clampedPos;
 
     const slider = document.getElementById("lamp") as HTMLInputElement | null;
@@ -1745,19 +2209,23 @@ export async function mountApp(): Promise<void> {
         body: JSON.stringify({
           sessionId: rankedSession!.id,
           lampPosition: clampedPos,
+          ...rankedOrderBody(),
         }),
       }).catch(() => {
-        if (acceptRankedWrite(capturedWrite, capturedWrite.sessionId)) interruptRankedAttempt();
+        if (ignoreRankedFailure(capturedWrite, undefined)) return null;
+        interruptRankedAttempt();
         void refreshAuthSession().then(() => { renderPlayDynamicSections(); redrawStageCanvas(); });
         return null;
       });
       if (!res) return;
-      if (!acceptRankedWrite(capturedWrite, res.ok ? res.data.session.id : capturedWrite.sessionId)) {
-        return;
+      if (!res.ok) {
+        if (ignoreRankedFailure(capturedWrite, res.data.error)) return;
       }
       if (res.ok) {
-        rankedSession = res.data.session;
-        announceLevelUps(rankedSession.id, res.data.levelUps);
+        const aimed = installRankedSession(res.data.session, capturedWrite, capturedWrite.sessionId);
+        if (!aimed) return;
+        applyAcceptedRankedDisplay(aimed, capturedWrite.epoch);
+        announceLevelUps(aimed.id, res.data.levelUps);
         renderPlayDynamicSections();
         redrawStageCanvas();
       } else if (rankedSession) {
@@ -1770,6 +2238,87 @@ export async function mountApp(): Promise<void> {
       return;
     }
     redrawStageCanvas();
+  }
+
+  function applyAcceptedRankedDisplay(session: LedSession, responseGeneration: number): void {
+    if (responseGeneration !== rankedWriteEpoch) return;
+    const durationSeconds = policyForSession(session).durationSeconds;
+    const nowMonoMs = performance.now();
+    if (session.status === "egg" || session.status === "paused") {
+      rankedDisplayClock = createRankedDisplayClock();
+      return;
+    }
+    const hidden = document.visibilityState === "hidden";
+    const onPlay = currentRoute.kind === "play";
+    let advancing = false;
+    let hold: RankedDisplayFreeze | null = "completed";
+    if (session.status === "running") {
+      advancing = onPlay && !hidden && hardwareHealthy && !rankedRecoveryBlocked();
+      hold = advancing
+        ? null
+        : hidden
+          ? "hidden"
+          : !onPlay
+            ? "non-play"
+            : !hardwareHealthy
+              ? "stale-telemetry"
+              : "recovery";
+    }
+    rankedDisplayClock = anchorRankedDisplayClock({
+      clock: rankedDisplayClock,
+      responseGeneration,
+      liveGeneration: rankedWriteEpoch,
+      sessionId: session.id,
+      serverElapsed: session.elapsed,
+      nowMonoMs,
+      durationSeconds,
+      advancing,
+      hold,
+    });
+  }
+
+  function syncRankedDisplayClock(): void {
+    if (!authPlayer || activePlayMode !== "ranked" || !rankedSession) return;
+    rankedDisplayClock = reconcileRankedDisplayClock(rankedDisplayClock, {
+      nowMonoMs: performance.now(),
+      durationSeconds: policyForSession(rankedSession).durationSeconds,
+      liveGeneration: rankedWriteEpoch,
+      sessionId: rankedSession.id,
+      serverElapsed: rankedSession.elapsed,
+      status: rankedSession.status,
+      telemetryHealthy: hardwareHealthy,
+      recovering: rankedRecoveryBlocked(),
+      route: currentRoute.kind === "play" ? "play" : "other",
+      hidden: document.visibilityState === "hidden",
+    });
+  }
+
+  function readoutForTimer(sess: LedSession, durationSeconds: number): string {
+    if (
+      authPlayer &&
+      activePlayMode === "ranked" &&
+      rankedSession &&
+      sess.id === rankedSession.id &&
+      rankedDisplayClock.generation === rankedWriteEpoch &&
+      rankedDisplayClock.sessionId === sess.id
+    ) {
+      return formatRankedTimerReadout(
+        projectRankedDisplay(rankedDisplayClock, performance.now(), durationSeconds),
+        durationSeconds,
+      );
+    }
+    return `${sess.elapsed.toFixed(1)}s / ${durationSeconds}s`;
+  }
+
+  function paintRankedDisplayTimer(): void {
+    if (!authPlayer || activePlayMode !== "ranked" || !rankedSession) return;
+    syncRankedDisplayClock();
+    if (currentRoute.kind !== "play") return;
+    const timerEl = document.getElementById("timer-readout");
+    if (!timerEl) return;
+    const durationSeconds = policyForSession(rankedSession).durationSeconds;
+    const next = readoutForTimer(rankedSession, durationSeconds);
+    if (timerEl.textContent !== next) timerEl.textContent = next;
   }
 
   // ---------- Simulation / Illumination Loop ----------
@@ -1787,7 +2336,10 @@ export async function mountApp(): Promise<void> {
     const wasHealthy = hardwareHealthy;
     const isFreshNow = syncTelemetryFreshness(nowMs);
 
-    if (currentRoute.kind !== "play") return;
+    if (currentRoute.kind !== "play") {
+      syncRankedDisplayClock();
+      return;
+    }
 
     if (!isFreshNow && wasHealthy) {
       interruptRankedAttempt();
@@ -1831,39 +2383,12 @@ export async function mountApp(): Promise<void> {
           body: JSON.stringify({
             sessionId: rankedSession.id,
             lampPosition: rankedSession.lampPosition,
+            ...rankedOrderBody(),
           }),
         })
           .then(async (res) => {
-            if (!acceptRankedWrite(capturedWrite, res.ok ? res.data.session.id : capturedWrite.sessionId)) return;
-            if (res.ok) {
-              if (!acceptRankedWrite(capturedWrite, res.data.session.id)) return;
-              const prevLevels = rankedSession
-                ? rankedSession.regions.map((r) => r.level)
-                : [0, 0, 0];
-              rankedSession = res.data.session;
-              if (res.data.reading) {
-                telemetryTracker.ingestBackendReading(
-                  res.data.reading,
-                  dayStartWorkUnits.toString(),
-                );
-                syncTelemetryFreshness(Date.now());
-              }
-              currentPaletteSchedule = res.data.paletteSchedule;
-              currentAccessorySchedule = res.data.accessorySchedule;
-              announceLevelUps(rankedSession.id, res.data.levelUps);
-              if (
-                prevLevels[0] !== rankedSession.regions[0].level ||
-                prevLevels[1] !== rankedSession.regions[1].level ||
-                prevLevels[2] !== rankedSession.regions[2].level
-              ) {
-                redrawStageCanvas();
-              }
-              if (res.data.readyToComplete && !rankedSnapshot) {
-                await handleCompleteSession();
-              } else {
-                renderPlayDynamicSections();
-              }
-            } else {
+            if (!res.ok) {
+              if (ignoreRankedFailure(capturedWrite, res.data?.error)) return;
               interruptRankedAttempt();
               void refreshAuthSession().then(() => { renderPlayDynamicSections(); redrawStageCanvas(); });
               if (res.status === 503) {
@@ -1878,10 +2403,39 @@ export async function mountApp(): Promise<void> {
               );
               renderPlayDynamicSections();
               redrawStageCanvas();
+              return;
+            }
+            const prevLevels = rankedSession
+              ? rankedSession.regions.map((r) => r.level)
+              : [0, 0, 0];
+            const installed = installRankedSession(res.data.session, capturedWrite, capturedWrite.sessionId);
+            if (!installed) return;
+            if (res.data.reading) {
+              telemetryTracker.ingestBackendReading(
+                res.data.reading,
+                dayStartWorkUnits.toString(),
+              );
+              syncTelemetryFreshness(Date.now());
+            }
+            currentPaletteSchedule = res.data.paletteSchedule;
+            currentAccessorySchedule = res.data.accessorySchedule;
+            applyAcceptedRankedDisplay(installed, capturedWrite.epoch);
+            announceLevelUps(installed.id, res.data.levelUps);
+            if (
+              prevLevels[0] !== installed.regions[0].level ||
+              prevLevels[1] !== installed.regions[1].level ||
+              prevLevels[2] !== installed.regions[2].level
+            ) {
+              redrawStageCanvas();
+            }
+            if (res.data.readyToComplete && !rankedSnapshot) {
+              await handleCompleteSession();
+            } else {
+              renderPlayDynamicSections();
             }
           })
           .catch((err) => {
-            if (!acceptRankedWrite(capturedWrite, capturedWrite.sessionId)) return;
+            if (ignoreRankedFailure(capturedWrite, undefined)) return;
             interruptRankedAttempt();
             void refreshAuthSession().then(() => {
               renderPlayDynamicSections();
@@ -1942,6 +2496,8 @@ export async function mountApp(): Promise<void> {
       }
       renderPlayDynamicSections();
     }
+    // Ranked readout only. Heartbeat cadence, session fields, and control DOM stay put.
+    paintRankedDisplayTimer();
   }, 200);
 
   // Poll hardware status every 2.5s
@@ -2169,6 +2725,156 @@ export async function mountApp(): Promise<void> {
     });
   }
 
+  function applyStableControl(el: HTMLElement, spec: StableControlSpec): void {
+    if (el.className !== spec.className) el.className = spec.className;
+    if (spec.tag === "button") {
+      const button = el as HTMLButtonElement;
+      if (button.disabled !== spec.disabled) button.disabled = spec.disabled;
+    }
+    if (spec.html !== undefined) {
+      if (el.innerHTML !== spec.html) el.innerHTML = spec.html;
+    } else if (el.textContent !== spec.text) {
+      el.textContent = spec.text;
+    }
+    if (spec.attrs) {
+      for (const [name, value] of Object.entries(spec.attrs)) {
+        if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+      }
+    }
+  }
+
+  function sessionControlHandler(id: string): (() => void) | null {
+    if (id === "btn-start-lamp") return () => { void handleStartIllumination(); };
+    if (id === "btn-restart-attempt") return () => { void handleRestartAttempt(); };
+    if (id === "btn-complete-session") return () => { void handleCompleteSession(); };
+    if (id === "btn-reset-egg") return () => { void handleResetOrNewEgg(); };
+    return null;
+  }
+
+  function syncStableControls(parent: HTMLElement, specs: readonly StableControlSpec[]): void {
+    const created = new Map<string, HTMLElement>();
+    syncStableControlHost(
+      {
+        ids() {
+          return [...parent.children]
+            .map((node) => (node instanceof HTMLElement ? node.id : ""))
+            .filter((id) => id.length > 0);
+        },
+        create(spec) {
+          const el = document.createElement(spec.tag);
+          el.id = spec.id;
+          if (spec.tag === "button") {
+            const button = el as HTMLButtonElement;
+            button.type = "button";
+            const handler = sessionControlHandler(spec.id);
+            if (handler) button.addEventListener("click", handler);
+          }
+          applyStableControl(el, spec);
+          created.set(spec.id, el);
+        },
+        update(id, spec) {
+          const existing = parent.querySelector<HTMLElement>(`#${id}`);
+          if (existing && existing.parentElement === parent) applyStableControl(existing, spec);
+        },
+        remove(id) {
+          const existing = parent.querySelector<HTMLElement>(`#${id}`);
+          if (existing && existing.parentElement === parent) existing.remove();
+        },
+        placeNew(id, beforeId) {
+          const el = created.get(id);
+          if (!el || el.isConnected) return;
+          const before = beforeId ? parent.querySelector<HTMLElement>(`#${beforeId}`) : null;
+          if (before && before.parentElement === parent) parent.insertBefore(el, before);
+          else parent.appendChild(el);
+        },
+      },
+      specs,
+    );
+  }
+
+  function mountModeSelector(modeContainer: HTMLElement): void {
+    if (modeContainer.dataset.modeBound === "1") return;
+    modeContainer.dataset.modeBound = "1";
+    modeContainer.innerHTML = `
+      <div class="led-mode-selector" role="radiogroup" aria-label="Game Play Mode">
+        <span style="font-size:0.85rem; font-weight:600; color:var(--text-subtle); margin-right:0.5rem;">Mode:</span>
+        <button type="button" class="led-mode-btn" id="btn-mode-ranked"></button>
+        <button type="button" class="led-mode-btn" id="btn-mode-demo"></button>
+      </div>
+      <div class="led-mode-notice" id="mode-allowance-notice" hidden></div>
+    `;
+    document.getElementById("btn-mode-ranked")?.addEventListener("click", () => {
+      if (eggConfirmed) return;
+      invalidateRankedWrites();
+      activePlayMode = "ranked";
+      void refreshAuthSession().then(() => { renderPlayDynamicSections(); redrawStageCanvas(); });
+      renderPlayDynamicSections();
+    });
+    document.getElementById("btn-mode-demo")?.addEventListener("click", () => {
+      if (eggConfirmed) return;
+      invalidateRankedWrites();
+      activePlayMode = "demo";
+      renderPlayDynamicSections();
+    });
+  }
+
+  function mountRegionAimCards(regionsList: HTMLElement): void {
+    if (regionsList.dataset.aimBound === "1") return;
+    regionsList.dataset.aimBound = "1";
+    const regionNames = ["Head", "Body & Chest", "Belly & Tail"];
+    regionsList.innerHTML = [0, 1, 2]
+      .map((idx) => `
+        <button type="button" class="led-region-item" data-region-card="${idx}" aria-pressed="false" aria-label="Aim lamp at ${regionNames[idx]}">
+          <div class="led-region-row">
+            <span class="led-region-title" data-region-title>${regionNames[idx]}</span>
+            <strong class="led-region-lv" data-region-level>Lv0 / 10</strong>
+          </div>
+          <div class="led-progress-track" role="progressbar" data-region-progress aria-valuenow="0" aria-valuemin="0" aria-valuemax="10">
+            <div class="led-progress-fill" data-region-fill style="width: 0%"></div>
+          </div>
+          <div class="led-maturity-text" data-region-maturity>0% maturity</div>
+        </button>
+      `)
+      .join("");
+    regionsList.querySelectorAll<HTMLElement>("[data-region-card]").forEach((card) => {
+      card.addEventListener("click", () => {
+        const region = Number(card.getAttribute("data-region-card")) as 0 | 1 | 2;
+        void handleAimLamp(positionForRegionAim(region), true);
+      });
+    });
+  }
+
+  function patchRegionAimCards(
+    regionsList: HTMLElement,
+    sess: LedSession,
+    aimedReg: number,
+    levelUpRegion: number | null,
+  ): void {
+    const regionNames = ["Head", "Body & Chest", "Belly & Tail"];
+    for (const idx of [0, 1, 2]) {
+      const card = regionsList.querySelector<HTMLElement>(`[data-region-card="${idx}"]`);
+      if (!card) continue;
+      const region = sess.regions[idx as 0 | 1 | 2]!;
+      const isAimed = aimedReg === idx;
+      card.classList.toggle("aimed", isAimed);
+      card.classList.toggle("led-region-levelup", levelUpRegion === idx);
+      card.setAttribute("aria-pressed", String(isAimed));
+      card.setAttribute("aria-label", `Aim lamp at ${regionNames[idx]}`);
+      const title = card.querySelector<HTMLElement>("[data-region-title]");
+      if (title) title.textContent = `${regionNames[idx]}${isAimed ? " · aimed" : ""}`;
+      const level = card.querySelector<HTMLElement>("[data-region-level]");
+      if (level) level.textContent = `Lv${region.level} / 10`;
+      const pct = clamp((region.continuousLevel / 10) * 100, 0, 100);
+      const maturityPct = Math.min(100, Math.round((region.dose / 19) * 100));
+      const progress = card.querySelector<HTMLElement>("[data-region-progress]");
+      if (progress) progress.setAttribute("aria-valuenow", String(region.level));
+      const fill = card.querySelector<HTMLElement>("[data-region-fill]");
+      if (fill) fill.style.width = `${pct.toFixed(1)}%`;
+      const maturity = card.querySelector<HTMLElement>("[data-region-maturity]");
+      if (maturity) maturity.textContent = `${maturityPct}% maturity`;
+    }
+  }
+
   function renderPlayDynamicSections(): void {
     const sess = activeSession();
     const snap = activeCompletedSnapshot();
@@ -2193,35 +2899,29 @@ export async function mountApp(): Promise<void> {
         const remaining = userAllowance ? userAllowance.remaining : 3;
         const total = userAllowance ? userAllowance.total : 3;
         const isExhausted = remaining === 0;
-        modeContainer.innerHTML = `
-          <div class="led-mode-selector" role="radiogroup" aria-label="Game Play Mode">
-            <span style="font-size:0.85rem; font-weight:600; color:var(--text-subtle); margin-right:0.5rem;">Mode:</span>
-            <button type="button" class="led-mode-btn ${activePlayMode === "ranked" ? "active" : ""}" id="btn-mode-ranked" ${eggConfirmed ? "disabled" : ""}>
-              🏆 Ranked (${remaining}/${total} left today)
-            </button>
-            <button type="button" class="led-mode-btn ${activePlayMode === "demo" ? "active" : ""}" id="btn-mode-demo" ${eggConfirmed ? "disabled" : ""}>
-              🧪 Play Demo (Unlimited)
-            </button>
-          </div>
-          ${
-            isExhausted && activePlayMode === "ranked"
-              ? `<div class="led-mode-notice">Daily ranked allowance exhausted (0/${total}). You can continue playing unlimited unranked Demo games!</div>`
-              : ""
+        mountModeSelector(modeContainer);
+        const rankedBtn = document.getElementById("btn-mode-ranked") as HTMLButtonElement | null;
+        const demoBtn = document.getElementById("btn-mode-demo") as HTMLButtonElement | null;
+        const notice = document.getElementById("mode-allowance-notice");
+        if (rankedBtn) {
+          rankedBtn.className = `led-mode-btn${activePlayMode === "ranked" ? " active" : ""}`;
+          rankedBtn.disabled = eggConfirmed;
+          const label = `🏆 Ranked (${remaining}/${total} left today)`;
+          if (rankedBtn.textContent !== label) rankedBtn.textContent = label;
+        }
+        if (demoBtn) {
+          demoBtn.className = `led-mode-btn${activePlayMode === "demo" ? " active" : ""}`;
+          demoBtn.disabled = eggConfirmed;
+          const label = "🧪 Play Demo (Unlimited)";
+          if (demoBtn.textContent !== label) demoBtn.textContent = label;
+        }
+        if (notice) {
+          const showNotice = isExhausted && activePlayMode === "ranked";
+          notice.hidden = !showNotice;
+          if (showNotice) {
+            notice.textContent = `Daily ranked allowance exhausted (0/${total}). You can continue playing unlimited unranked Demo games!`;
           }
-        `;
-        document.getElementById("btn-mode-ranked")?.addEventListener("click", () => {
-          if (eggConfirmed) return;
-          invalidateRankedWrites();
-          activePlayMode = "ranked";
-          void refreshAuthSession().then(() => { renderPlayDynamicSections(); redrawStageCanvas(); });
-          renderPlayDynamicSections();
-        });
-        document.getElementById("btn-mode-demo")?.addEventListener("click", () => {
-          if (eggConfirmed) return;
-          invalidateRankedWrites();
-          activePlayMode = "demo";
-          renderPlayDynamicSections();
-        });
+        }
       } else {
         modeContainer.style.display = "none";
       }
@@ -2246,7 +2946,7 @@ export async function mountApp(): Promise<void> {
 
     const timerEl = document.getElementById("timer-readout");
     if (timerEl) {
-      timerEl.textContent = `${sess.elapsed.toFixed(1)}s / ${sessPolicy.durationSeconds}s`;
+      timerEl.textContent = readoutForTimer(sess, sessPolicy.durationSeconds);
     }
 
     // 2. Species buttons & Egg selector visibility
@@ -2283,49 +2983,65 @@ export async function mountApp(): Promise<void> {
       const canRestart = hasLocked && !isCompleted && sess.elapsed > 0;
       const remainingPlays = userAllowance ? userAllowance.remaining : 3;
       const totalPlays = userAllowance ? userAllowance.total : 3;
-      const allowanceBadge = authPlayer && activePlayMode === "ranked"
-        ? `<span class="led-account-allowance" style="display:inline-block; margin-left:0.5rem; vertical-align:middle;">Plays left today: <strong>${remainingPlays} / ${totalPlays}</strong></span>`
-        : "";
-
-      controlsEl.innerHTML = `
-        ${
-          !isRunning && !isCompleted && !readyToHatch
-            ? `<button type="button" class="led-btn-primary" id="btn-start-lamp" ${rankedRecoveryBlocked() ? "disabled" : ""}>
-                ${authPlayer && activePlayMode === "ranked" ? "Start Ranked Lamp (Lock Traits)" : "Illuminate Demo Egg (Lock Traits)"}
-              </button>`
-            : ""
-        }
-        ${
-          canRestart || (hasLocked && !isCompleted)
-            ? `<button type="button" class="led-btn-ghost" id="btn-restart-attempt">Restart Attempt</button>`
-            : ""
-        }
-        ${
-          hasLocked && !isCompleted && readyToHatch
-            ? `<button type="button" class="led-btn-primary" id="btn-complete-session">
-                Complete Character & Reveal Portrait
-              </button>`
-            : ""
-        }
-        ${rankedRecoveryBlocked() ? '<span role="status">Reconnecting Ranked egg…</span>' : ""}
-        <button type="button" class="led-btn-ghost" id="btn-reset-egg" ${rankedRecoveryBlocked() ? "disabled" : ""}>
-          ${authPlayer && activePlayMode === "ranked" ? (isCompleted ? "Claim New Ranked Egg" : "Abandon & New Egg") : (isCompleted ? "New Demo Egg" : "New Egg Selection")}
-        </button>
-        ${allowanceBadge}
-      `;
-
-      document.getElementById("btn-start-lamp")?.addEventListener("click", () => {
-        void handleStartIllumination();
-      });
-      document.getElementById("btn-restart-attempt")?.addEventListener("click", () => {
-        void handleRestartAttempt();
-      });
-      document.getElementById("btn-complete-session")?.addEventListener("click", () => {
-        void handleCompleteSession();
-      });
-      document.getElementById("btn-reset-egg")?.addEventListener("click", () => {
-        void handleResetOrNewEgg();
-      });
+      const showAllowance = Boolean(authPlayer && activePlayMode === "ranked");
+      const resetLabel = authPlayer && activePlayMode === "ranked"
+        ? (isCompleted ? "Claim New Ranked Egg" : "Abandon & New Egg")
+        : (isCompleted ? "New Demo Egg" : "New Egg Selection");
+      syncStableControls(controlsEl, [
+        {
+          id: "btn-start-lamp",
+          tag: "button",
+          present: !isRunning && !isCompleted && !readyToHatch,
+          text: authPlayer && activePlayMode === "ranked"
+            ? "Start Ranked Lamp (Lock Traits)"
+            : "Illuminate Demo Egg (Lock Traits)",
+          className: "led-btn-primary",
+          disabled: rankedRecoveryBlocked(),
+        },
+        {
+          id: "btn-restart-attempt",
+          tag: "button",
+          present: canRestart || (hasLocked && !isCompleted),
+          text: "Restart Attempt",
+          className: "led-btn-ghost",
+          disabled: false,
+        },
+        {
+          id: "btn-complete-session",
+          tag: "button",
+          present: hasLocked && !isCompleted && readyToHatch,
+          text: "Complete Character & Reveal Portrait",
+          className: "led-btn-primary",
+          disabled: false,
+        },
+        {
+          id: "ranked-reconnect-status",
+          tag: "span",
+          present: rankedRecoveryBlocked(),
+          text: "Reconnecting Ranked egg…",
+          className: "",
+          disabled: false,
+          attrs: { role: "status" },
+        },
+        {
+          id: "btn-reset-egg",
+          tag: "button",
+          present: true,
+          text: resetLabel,
+          className: "led-btn-ghost",
+          disabled: rankedRecoveryBlocked(),
+        },
+        {
+          id: "session-allowance-badge",
+          tag: "span",
+          present: showAllowance,
+          text: "",
+          html: `Plays left today: <strong>${remainingPlays} / ${totalPlays}</strong>`,
+          className: "led-account-allowance",
+          disabled: false,
+          attrs: { style: "display:inline-block; margin-left:0.5rem; vertical-align:middle;" },
+        },
+      ]);
     }
 
     // 5. Regional Growth Lv0-10
@@ -2336,38 +3052,10 @@ export async function mountApp(): Promise<void> {
 
     const regionsList = document.getElementById("regions-list");
     if (regionsList) {
-      const regionNames = ["Head", "Body & Chest", "Belly & Tail"];
       const levelUpRegion =
         levelUpBanner && levelUpBanner.expiresAt > Date.now() ? levelUpBanner.region : null;
-      regionsList.innerHTML = [0, 1, 2]
-        .map((idx) => {
-          const r = sess.regions[idx as 0 | 1 | 2]!;
-          const isAimed = aimedReg === idx;
-          const pct = clamp((r.continuousLevel / 10) * 100, 0, 100);
-          const maturityPct = Math.min(100, Math.round((r.dose / 19) * 100));
-          const pulse = levelUpRegion === idx ? "led-region-levelup" : "";
-          return `
-            <button type="button" class="led-region-item ${isAimed ? "aimed" : ""} ${pulse}" data-region-card="${idx}" aria-pressed="${isAimed}" aria-label="Aim lamp at ${regionNames[idx]}">
-              <div class="led-region-row">
-                <span class="led-region-title">
-                  ${regionNames[idx]}${isAimed ? " · aimed" : ""}
-                </span>
-                <strong class="led-region-lv">Lv${r.level} / 10</strong>
-              </div>
-              <div class="led-progress-track" role="progressbar" aria-valuenow="${r.level}" aria-valuemin="0" aria-valuemax="10">
-                <div class="led-progress-fill" style="width: ${pct.toFixed(1)}%"></div>
-              </div>
-              <div class="led-maturity-text">${maturityPct}% maturity</div>
-            </button>
-          `;
-        })
-        .join("");
-      regionsList.querySelectorAll<HTMLElement>("[data-region-card]").forEach((card) => {
-        card.addEventListener("click", () => {
-          const region = Number(card.getAttribute("data-region-card")) as 0 | 1 | 2;
-          void handleAimLamp(positionForRegionAim(region), true);
-        });
-      });
+      mountRegionAimCards(regionsList);
+      patchRegionAimCards(regionsList, sess, aimedReg, levelUpRegion);
     }
 
     // 6. Telemetry & Schedules (100 work units / 100m)
@@ -2545,7 +3233,7 @@ export async function mountApp(): Promise<void> {
         resultPanel.hidden = true;
       }
     }
-    updateLampAndShellVisuals();
+    redrawStageCanvas();
   }
 
   function renderProfileSection(): void {
@@ -2668,9 +3356,8 @@ export async function mountApp(): Promise<void> {
           .map(
             (entry) => `
           <div class="led-card led-top3-card led-lb-row" data-result-id="${escapeAttr(entry.resultId)}" tabindex="0" role="link" aria-label="Inspect rank #${entry.rank} portrait for ${escapeAttr(entry.effectiveName)}">
-            <div class="led-top3-portrait-wrap">
+            <div class="led-top3-portrait-wrap" data-portrait-for="${escapeAttr(entry.resultId)}">
               <span class="led-top3-rank-badge led-top3-rank-${entry.rank}">#${entry.rank}</span>
-              <canvas id="full-top3-canvas-${entry.rank}" class="led-top3-portrait-img" width="400" height="400"></canvas>
             </div>
             <div class="led-top3-info">
               <div class="led-top3-name">${escapeText(entry.effectiveName)}</div>
@@ -2751,6 +3438,70 @@ export async function mountApp(): Promise<void> {
     });
   }
 
+  function familyIndexForLeaderboard(familyId: string): 0 | 1 | 2 {
+    if (familyId === "relay") return 1;
+    if (familyId === "prism") return 2;
+    return 0;
+  }
+
+  function leaderboardPortraitKey(entry: LeaderboardEntryDto): string {
+    return portraitVisualKey({
+      family: familyIndexForLeaderboard(entry.familyId),
+      levels: entry.levels,
+      palette: entry.palette.index,
+      accessory: entry.accessory.index,
+      background: entry.background.index,
+      staticOnly: true,
+    });
+  }
+
+  function leaderboardMarkupSignature(
+    entries: readonly LeaderboardEntryDto[],
+    loading: boolean,
+    weekKey: string,
+  ): string {
+    if (entries.length === 0) return `${loading ? "loading" : "empty"}|${weekKey}`;
+    return `${weekKey}|${entries
+      .map((entry) =>
+        [
+          entry.rank,
+          entry.resultId,
+          entry.effectiveName,
+          entry.familyId,
+          entry.familyName,
+          entry.levels.join(","),
+          entry.palette.index,
+          entry.palette.name,
+          entry.palette.points,
+          entry.accessory.index,
+          entry.accessory.name,
+          entry.accessory.points,
+          entry.background.index,
+          entry.background.name,
+          entry.background.points,
+          entry.scores.regionsTotal,
+          entry.scores.total,
+        ].join("~"),
+      )
+      .join("|")}`;
+  }
+
+  function findLeaderboardPortraitWrap(container: HTMLElement, resultId: string): HTMLElement | null {
+    for (const wrap of container.querySelectorAll<HTMLElement>("[data-portrait-for]")) {
+      if (wrap.dataset.portraitFor === resultId) return wrap;
+    }
+    return null;
+  }
+
+  function releaseLeaderboardPortrait(resultId: string): void {
+    const rec = leaderboardPortraits.get(resultId);
+    if (!rec) return;
+    rec.adapter.stopAnimation();
+    rec.adapter.dispose();
+    rec.canvas.remove();
+    leaderboardPortraits.delete(resultId);
+  }
+
   function renderLeaderboardTables(): void {
     const badge = document.getElementById("lb-week-badge");
     if (badge) {
@@ -2759,20 +3510,57 @@ export async function mountApp(): Promise<void> {
         : "Weekly Top 100";
     }
     const fullContainer = document.getElementById("full-leaderboard-container");
-    if (fullContainer) {
-      fullContainer.innerHTML = buildFullLeaderboardHtml(leaderboardEntries);
-      bindLeaderboardRowClicks(fullContainer);
-      leaderboardEntries.slice(0, 3).forEach((entry) => {
-        const canvas = document.getElementById(
-          `full-top3-canvas-${entry.rank}`,
-        ) as HTMLCanvasElement | null;
-        if (!canvas) return;
+    if (!fullContainer) return;
+
+    if (currentRoute.kind !== "leaderboard") {
+      if (!leaderboardPlaceholderReady && leaderboardEntries.length === 0 && fullContainer.childElementCount === 0) {
+        fullContainer.innerHTML = buildFullLeaderboardHtml(leaderboardEntries);
+        leaderboardPlaceholderReady = true;
+        leaderboardViewSignature = leaderboardMarkupSignature(leaderboardEntries, false, leaderboardWeekKey);
+      }
+      return;
+    }
+
+    const top3 = leaderboardEntries.slice(0, 3);
+    const nextPortraits = top3.map((entry) => ({
+      resultId: entry.resultId,
+      visualKey: leaderboardPortraitKey(entry),
+    }));
+    const previousPortraits = [...leaderboardPortraits.entries()].map(([resultId, rec]) => ({
+      resultId,
+      visualKey: rec.visualKey,
+    }));
+    const plan = planLeaderboardPortraits(previousPortraits, nextPortraits);
+    const signature = leaderboardMarkupSignature(leaderboardEntries, leaderboardLoading, leaderboardWeekKey);
+    if (signature === leaderboardViewSignature && plan.dispose.length === 0 && plan.redraw.length === 0) {
+      return;
+    }
+
+    for (const resultId of plan.dispose) releaseLeaderboardPortrait(resultId);
+    for (const rec of leaderboardPortraits.values()) rec.canvas.remove();
+    fullContainer.innerHTML = buildFullLeaderboardHtml(leaderboardEntries);
+    bindLeaderboardRowClicks(fullContainer);
+
+    const redraw = new Set(plan.redraw);
+    for (const entry of top3) {
+      const wrap = findLeaderboardPortraitWrap(fullContainer, entry.resultId);
+      if (!wrap) continue;
+      const visualKey = leaderboardPortraitKey(entry);
+      let rec = leaderboardPortraits.get(entry.resultId);
+      if (!rec) {
+        const canvas = document.createElement("canvas");
+        canvas.className = "led-top3-portrait-img";
         const adapter = new LedPortraitAdapter(canvas, { size: 400 });
-        const famIdx =
-          entry.familyId === "pulse" ? 0 : entry.familyId === "relay" ? 1 : 2;
-        adapter.draw(
+        rec = { adapter, canvas, visualKey: "" };
+        leaderboardPortraits.set(entry.resultId, rec);
+      }
+      rec.canvas.id = `full-top3-canvas-${entry.rank}`;
+      rec.canvas.className = "led-top3-portrait-img";
+      wrap.appendChild(rec.canvas);
+      if (redraw.has(entry.resultId) || rec.visualKey !== visualKey) {
+        rec.adapter.draw(
           {
-            family: famIdx,
+            family: familyIndexForLeaderboard(entry.familyId),
             palette: entry.palette.index,
             accessory: entry.accessory.index,
             background: entry.background.index,
@@ -2780,8 +3568,12 @@ export async function mountApp(): Promise<void> {
           },
           { staticOnly: true },
         );
-      });
+        rec.adapter.stopAnimation();
+        rec.visualKey = visualKey;
+      }
     }
+    leaderboardViewSignature = signature;
+    leaderboardPlaceholderReady = true;
   }
 
   function renderNftView(): void {
@@ -2808,13 +3600,46 @@ export async function mountApp(): Promise<void> {
     const { snapshot, player, leaderboardRank } = nftDetailData;
     titleEl.textContent = `Squeek ${snapshot.familyName} · ${player.effectiveName}`;
 
-    void nftAdapter.drawAsync({
+    const nextKey = portraitVisualKey({
       family: snapshot.familyIndex,
       levels: snapshot.levels,
       palette: snapshot.paletteIndex,
       accessory: snapshot.accessoryIndex,
       background: snapshot.backgroundIndex,
+      staticOnly: false,
     });
+    const drawPortrait = shouldDrawPortrait({
+      previousKey: nftPortraitKey,
+      nextKey,
+      routeVisible: currentRoute.kind === "result",
+      canvasFullyHidden: false,
+      pixelsSampledWhileHidden: false,
+    });
+    if (drawPortrait) {
+      const token = ++nftDrawToken;
+      nftPortraitKey = nextKey;
+      void nftAdapter.drawAsync({
+        family: snapshot.familyIndex,
+        levels: snapshot.levels,
+        palette: snapshot.paletteIndex,
+        accessory: snapshot.accessoryIndex,
+        background: snapshot.backgroundIndex,
+      }).then(() => {
+        if (token !== nftDrawToken) return;
+        if (currentRoute.kind !== "result") nftAdapter.stopAnimation();
+      });
+    } else if (
+      shouldResumeAccessoryAnimation({
+        previousKey: nftPortraitKey,
+        nextKey,
+        routeVisible: currentRoute.kind === "result",
+        canvasFullyHidden: false,
+        animating: nftAdapter.status.animating,
+        accessoryAnimates: snapshot.accessoryIndex >= 7 && !prefersReducedMotion(),
+      })
+    ) {
+      nftAdapter.resumeAccessoryAnimation();
+    }
 
     metaEl.innerHTML = `
       <div class="led-nft-meta-card">
@@ -2848,6 +3673,7 @@ export async function mountApp(): Promise<void> {
   }
 
   function renderRouteVisibility(): void {
+    syncRankedDisplayClock();
     const viewPlay = document.getElementById("view-play");
     const viewLb = document.getElementById("view-leaderboard");
     const viewNft = document.getElementById("view-nft");
@@ -2865,17 +3691,22 @@ export async function mountApp(): Promise<void> {
 
     if (currentRoute.kind === "play") {
       nftAdapter.stopAnimation();
+      syncDocsCatalog(false);
       redrawStageCanvas();
+      paintRankedDisplayTimer();
     } else if (currentRoute.kind === "result") {
       stageAdapter.stopAnimation();
+      syncDocsCatalog(false);
       void loadPublicNftDetail(currentRoute.resultId);
     } else if (currentRoute.kind === "leaderboard") {
       stageAdapter.stopAnimation();
       nftAdapter.stopAnimation();
+      syncDocsCatalog(false);
       void refreshLeaderboard();
     } else {
       stageAdapter.stopAnimation();
       nftAdapter.stopAnimation();
+      syncDocsCatalog(true);
     }
   }
 
@@ -2885,7 +3716,6 @@ export async function mountApp(): Promise<void> {
     renderPlayDynamicSections();
     renderProfileSection();
     renderLeaderboardTables();
-    renderDocsCatalogTables();
     renderRouteVisibility();
   }
 
@@ -2900,6 +3730,7 @@ export async function mountApp(): Promise<void> {
   });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
+      syncRankedDisplayClock();
       void handlePauseIllumination();
     }
   });
@@ -2933,34 +3764,52 @@ export async function mountApp(): Promise<void> {
   const lampHandleElem = document.getElementById("lamp-handle-elem");
   const railHit = document.getElementById("rail-hit");
 
+  function sceneYFromClientY(clientY: number): number {
+    const span = sceneRailSpan();
+    const fallback = (span.y1 + span.y2) / 2;
+    if (!stageWrap) return fallback;
+    const rect = stageWrap.getBoundingClientRect();
+    if (rect.height <= 0) return fallback;
+    return ((clientY - rect.top) / rect.height) * INCUBATION_SCENE.height;
+  }
+
   function railYFromEvent(e: PointerEvent): number {
-    if (!stageWrap) return 215;
-    const r = stageWrap.getBoundingClientRect();
-    return ((e.clientY - r.top) / r.height) * 420;
+    return sceneYFromClientY(e.clientY);
   }
 
   let draggingRail = false;
+  let railPointerId = -1;
+  let railDragAim = 0;
   for (const el of [lampHandleElem, railHit]) {
     if (!el) continue;
     el.addEventListener("pointerdown", (e) => {
       if (activeSession().status === "completed") return;
+      if (draggingRail) return;
       e.preventDefault();
       draggingRail = true;
-      (el as HTMLElement).setPointerCapture(e.pointerId);
-      void handleAimLamp(positionForRailY(railYFromEvent(e)), false);
+      railPointerId = e.pointerId;
+      if (e.isTrusted) (el as HTMLElement).setPointerCapture(e.pointerId);
+      railDragAim = positionForSceneRailY(railYFromEvent(e));
+      void handleAimLamp(railDragAim, false);
       lampHandleElem?.focus({ preventScroll: true });
     });
     el.addEventListener("pointermove", (e) => {
-      if (draggingRail) {
-        void handleAimLamp(positionForRailY(railYFromEvent(e)), false);
-      }
+      if (!draggingRail || e.pointerId !== railPointerId) return;
+      railDragAim = positionForSceneRailY(railYFromEvent(e));
+      void handleAimLamp(railDragAim, false);
     });
     for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) {
       el.addEventListener(ev, (e) => {
-        if (draggingRail) {
-          draggingRail = false;
-          void handleAimLamp(positionForRailY(railYFromEvent(e as PointerEvent)), true);
+        const pointer = e as PointerEvent;
+        if (!draggingRail || pointer.pointerId !== railPointerId) return;
+        draggingRail = false;
+        railPointerId = -1;
+        if (ev === "pointerup") {
+          void handleAimLamp(positionForSceneRailY(railYFromEvent(pointer)), true);
+          return;
         }
+        // Cancel and lost capture often report clientY 0. Keep the last drag aim.
+        void handleAimLamp(railDragAim, true);
       });
     }
   }
@@ -2990,27 +3839,36 @@ export async function mountApp(): Promise<void> {
 
   // Pointer drag on stage canvas wrap to aim lamp height smoothly
   let draggingStage = false;
+  let stagePointerId = -1;
+  let stageDragAim = 0;
   const aimFromStagePointer = (clientY: number, commit: boolean) => {
-    if (!stageWrap) return;
-    const rect = stageWrap.getBoundingClientRect();
-    if (rect.height <= 0) return;
-    const rel = clamp((clientY - rect.top) / rect.height, 0, 1);
-    const pos = Math.round(rel * 200 - 100);
-    void handleAimLamp(pos, commit);
+    const aim = positionForSceneRailY(sceneYFromClientY(clientY));
+    void handleAimLamp(aim, commit);
+    return aim;
   };
   stageWrap?.addEventListener("pointerdown", (e) => {
     if (e.target === lampHandleElem || e.target === railHit) return;
+    if (draggingStage) return;
     draggingStage = true;
-    aimFromStagePointer(e.clientY, false);
+    stagePointerId = e.pointerId;
+    stageDragAim = aimFromStagePointer(e.clientY, false);
   });
   window.addEventListener("pointermove", (e) => {
-    if (!draggingStage) return;
-    aimFromStagePointer(e.clientY, false);
+    if (!draggingStage || e.pointerId !== stagePointerId) return;
+    stageDragAim = aimFromStagePointer(e.clientY, false);
   });
   window.addEventListener("pointerup", (e) => {
-    if (!draggingStage) return;
+    if (!draggingStage || e.pointerId !== stagePointerId) return;
     draggingStage = false;
+    stagePointerId = -1;
     aimFromStagePointer(e.clientY, true);
+  });
+  window.addEventListener("pointercancel", (e) => {
+    if (!draggingStage || e.pointerId !== stagePointerId) return;
+    draggingStage = false;
+    stagePointerId = -1;
+    // A native cancel can arrive at client 0,0. That is not a new aim.
+    void handleAimLamp(stageDragAim, true);
   });
 
   document.getElementById("btn-refresh-lb")?.addEventListener("click", () => {
@@ -3078,7 +3936,6 @@ export async function mountApp(): Promise<void> {
   await Promise.all([
     refreshAuthSession(),
     pollHardwareStatus(),
-    refreshLeaderboard(),
   ]);
   renderAll();
   (window as unknown as Record<string, unknown>).__squeekAppMounted = true;

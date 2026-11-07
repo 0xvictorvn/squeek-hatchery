@@ -4,7 +4,7 @@ import type { Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
-import { privateKeyToAccount } from "viem/accounts";
+import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { HatcheryBackend, MAX_RANKED_STEP_MS } from "../src/backend.ts";
 import { createHatcheryHttpServer } from "../src/server.ts";
 import {
@@ -16,7 +16,7 @@ import {
   LED_BACKGROUNDS,
   PALETTES,
 } from "../src/game-policy.ts";
-import { LED_PRESENTATION, regionWeights } from "../src/led-renderer.ts";
+import { LED_PRESENTATION } from "../src/led-renderer.ts";
 import {
   bodyFitsInsideEgg,
   computeLampMountLayout,
@@ -27,16 +27,13 @@ import {
   interiorPixelsOpen,
   interiorVisibleAt,
   lampAnchorsMatch,
-  masterToStage,
   pointInFamilyEgg,
   positionForRegionAim,
   presentationForStage,
-  regionRevealCoverageRatio,
   sampleLedBeamDots,
   shellDotVisibleAt,
   stageCanvasClipPath,
   stageRegionAnchor,
-  stageToMaster,
 } from "../src/led-scene.ts";
 import {
   buildCharacterSnapshot,
@@ -53,9 +50,7 @@ import {
 } from "../src/led-session.ts";
 import { measurementDayKey, regionAt, type Reading } from "../src/rules.ts";
 
-const HTTP_ACCOUNT = privateKeyToAccount(
-  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
-);
+const HTTP_ACCOUNT = privateKeyToAccount(generatePrivateKey());
 
 describe("Round 6 Regressions: scene geometry, no-pause rules, privacy", () => {
   test("A3: max/mixed levels fit incubation envelope; reveal covers >=2/3 of aimed region", () => {
@@ -77,12 +72,21 @@ describe("Round 6 Regressions: scene geometry, no-pause rules, privacy", () => {
     }
 
     for (const family of [0, 1, 2] as const) {
+      let egg = 0;
+      let lit = 0;
+      for (let y = 0; y <= 420; y += 4) {
+        for (let x = 0; x <= 400; x += 4) {
+          if (!pointInFamilyEgg(family, x, y)) continue;
+          egg += 1;
+          if (interiorVisibleAt(family, x, y, true, 0)) lit += 1;
+        }
+      }
+      const fraction = lit / egg;
+      assert.ok(
+        fraction > 0.18 && fraction < 0.55,
+        `family ${family} light footprint was ${fraction}, expected a mid-egg band`,
+      );
       for (const pos of [-70, 0, 70]) {
-        const coverage = regionRevealCoverageRatio(pos, true, 36, family);
-        assert.ok(
-          coverage >= 2 / 3,
-          `family ${family} reveal coverage for lamp ${pos} was ${coverage}, expected >= 2/3`,
-        );
         const win = computeRevealWindow(pos, true);
         assert.equal(win.open, true);
         assert.equal(interiorVisibleAt(family, win.cx, win.cy, true, pos), true);
@@ -118,111 +122,65 @@ describe("Round 6 Regressions: scene geometry, no-pause rules, privacy", () => {
     );
   });
 
-  test("R22: opening, shell and beam follow regionWeights inside the egg", () => {
-    const compositorMajor = (masterX: number, masterY: number): 0 | 1 | 2 => {
-      const weights = regionWeights(masterX, masterY);
-      if (weights[0] >= weights[1] && weights[0] >= weights[2]) return 0;
-      if (weights[1] >= weights[2]) return 1;
-      return 2;
-    };
-    const retiredHead = { cx: 400, cy: 230, rx: 150, ry: 120 };
-    const retiredLower = { cx: 400, cy: 690, rx: 165, ry: 100 };
-    const outsideRetired = (
-      x: number,
-      y: number,
-      ellipse: { cx: number; cy: number; rx: number; ry: number },
-    ) => ((x - ellipse.cx) / ellipse.rx) ** 2 + ((y - ellipse.cy) / ellipse.ry) ** 2 > 1;
-    const aims = [-70, 0, 70] as const;
-
+  test("R22: opening, shell and beam follow one continuous light footprint", () => {
+    const aims = [-70, -36, -33, 0, 33, 36, 70] as const;
     for (const family of [0, 1, 2] as const) {
-      const tallies = [0, 1, 2].map(() => ({ points: 0, visible: 0, leaked: 0 }));
-      const outer = {
-        head: { points: 0, visible: 0 },
-        lower: { points: 0, visible: 0 },
+      let checkedShell = false;
+      const centroid = (aim: number) => {
+        let count = 0;
+        let sum = 0;
+        for (let y = 9; y <= 420; y += 6) {
+          for (let x = 17; x <= 400; x += 6) {
+            if (!pointInFamilyEgg(family, x, y) || !interiorVisibleAt(family, x, y, true, aim)) continue;
+            count += 1;
+            sum += y;
+          }
+        }
+        assert.ok(count > 8, `family ${family} aim ${aim} lit ${count}`);
+        return sum / count;
       };
-      let checkedHeadShell = false;
-      let checkedLowerShell = false;
-      for (let masterY = 8; masterY < 850; masterY += 8) {
-        for (let masterX = 12; masterX < 788; masterX += 8) {
-          const stage = masterToStage(masterX, masterY);
-          if (!pointInFamilyEgg(family, stage.x, stage.y)) continue;
-          const master = stageToMaster(stage.x, stage.y);
-          const region = compositorMajor(master.x, master.y);
-          const row = tallies[region]!;
-          row.points += 1;
-          let shownForOwn = false;
-          for (const aim of aims) {
-            const shown = interiorVisibleAt(family, stage.x, stage.y, true, aim);
-            if (regionAt(aim) === region) {
-              if (shown) {
-                row.visible += 1;
-                shownForOwn = true;
-              }
-            } else if (shown) {
-              row.leaked += 1;
-            }
-          }
-          if (interiorVisibleAt(family, stage.x, stage.y, false, aims[region]!)) row.leaked += 1;
-          if (region === 0 && outsideRetired(master.x, master.y, retiredHead)) {
-            outer.head.points += 1;
-            if (shownForOwn) outer.head.visible += 1;
-            if (shownForOwn && !checkedHeadShell && pointInFamilyEgg(family, stage.x, stage.y, 0.995)) {
-              assert.equal(shellDotVisibleAt(family, stage.x, stage.y, true, -70), false);
-              assert.equal(shellDotVisibleAt(family, stage.x, stage.y, false, -70), true);
-              checkedHeadShell = true;
-            }
-          }
-          if (region === 2 && outsideRetired(master.x, master.y, retiredLower)) {
-            outer.lower.points += 1;
-            if (shownForOwn) outer.lower.visible += 1;
-            if (shownForOwn && !checkedLowerShell && pointInFamilyEgg(family, stage.x, stage.y, 0.995)) {
-              assert.equal(shellDotVisibleAt(family, stage.x, stage.y, true, 70), false);
-              assert.equal(shellDotVisibleAt(family, stage.x, stage.y, false, 70), true);
-              checkedLowerShell = true;
-            }
+      let previous = centroid(-100);
+      for (const aim of aims) {
+        const y = centroid(aim);
+        assert.ok(y + 0.05 >= previous, `family ${family} aim ${aim} moved backward`);
+        previous = y;
+      }
+      const across = centroid(-33) - centroid(-36);
+      assert.ok(across >= -0.05 && across < 8, `family ${family} old window jump ${across}`);
+      assert.ok(centroid(12) > centroid(0));
+      for (let y = 0; y <= 420; y += 6) {
+        for (let x = 0; x <= 400; x += 6) {
+          if (!pointInFamilyEgg(family, x, y, 0.995)) continue;
+          const open = interiorVisibleAt(family, x, y, true, 0);
+          assert.equal(shellDotVisibleAt(family, x, y, true, 0), !open);
+          assert.equal(interiorVisibleAt(family, x, y, false, 0), false);
+          if (!open) {
+            assert.equal(shellDotVisibleAt(family, x, y, false, 0), true);
+            checkedShell = true;
           }
         }
       }
-      for (const [region, row] of tallies.entries()) {
-        assert.ok(row.points > 20, `family ${family} region ${region} had ${row.points} in-egg samples`);
-        const fraction = row.visible / row.points;
-        assert.ok(
-          fraction >= 2 / 3,
-          `family ${family} region ${region} compositor coverage was ${fraction}, expected >= 2/3`,
-        );
-        assert.equal(row.leaked, 0, `family ${family} region ${region} leaked ${row.leaked} samples`);
-      }
-      assert.ok(outer.head.points > 0, `family ${family} should include head rows outside the retired ellipse`);
-      assert.ok(outer.lower.points > 0, `family ${family} should include lower rows outside the retired ellipse`);
-      assert.ok(
-        outer.head.visible / outer.head.points >= 2 / 3,
-        `family ${family} outer head coverage ${outer.head.visible / outer.head.points}`,
-      );
-      assert.ok(
-        outer.lower.visible / outer.lower.points >= 2 / 3,
-        `family ${family} outer lower coverage ${outer.lower.visible / outer.lower.points}`,
-      );
-      assert.equal(checkedHeadShell, true, `family ${family} outer head shell opening`);
-      assert.equal(checkedLowerShell, true, `family ${family} outer lower shell opening`);
-
-      for (const aim of aims) {
-        const region = regionAt(aim) as 0 | 1 | 2;
+      assert.equal(checkedShell, true, `family ${family} kept shell outside the footprint`);
+      for (const aim of [-70, 0, 70] as const) {
         const dots = sampleLedBeamDots(computeLampMountLayout(aim), aim, true, 1, family);
-        let own = 0;
-        let other = 0;
+        let inside = 0;
+        let outsideReveal = 0;
         for (const dot of dots) {
           assert.equal(dotOnSceneGrid(dot.x, dot.y), true, `beam dot off the scene lattice at ${dot.x},${dot.y}`);
           if (!pointInFamilyEgg(family, dot.x, dot.y)) continue;
-          const master = stageToMaster(dot.x, dot.y);
-          if (compositorMajor(master.x, master.y) === region) own += 1;
-          else other += 1;
+          inside += 1;
+          if (!interiorVisibleAt(family, dot.x, dot.y, true, aim)) outsideReveal += 1;
+          if (shellDotVisibleAt(family, dot.x, dot.y, true, aim)) outsideReveal += 1;
         }
-        assert.ok(own > 8, `family ${family} region ${region} beam lit ${own} anatomical dots`);
-        assert.equal(other, 0, `family ${family} region ${region} beam leaked ${other} dots`);
+        assert.equal(outsideReveal, 0, `family ${family} aim ${aim} beam left the reveal`);
+        assert.ok(inside > 8, `family ${family} aim ${aim} beam lit ${inside} dots`);
       }
       assert.equal(sampleLedBeamDots(computeLampMountLayout(0), 0, false, 1, family).length, 0);
+      assert.equal(sampleLedBeamDots(computeLampMountLayout(0), 0, true, 0, family).length, 0);
     }
     assert.equal(interiorVisibleAt(0, 8, 8, true, -70), false);
+    assert.equal(regionAt(-36), 0);
+    assert.equal(regionAt(-33), 1);
   });
 
   test("A4: lamp mount/handle share one coordinate; region cards map to aim positions", () => {

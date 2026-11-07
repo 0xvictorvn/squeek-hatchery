@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { HatcheryBackend } from "./src/backend.ts";
+import { writePlainStaticError } from "./src/static-cache.ts";
 import { normalizeNestedStaticPath, tryServeStaticFile } from "./src/server.ts";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -36,12 +37,15 @@ function squeekHatcheryPlugin(): Plugin {
         const normalized = normalizeNestedStaticPath(pathname);
 
         if (normalized.isLabAsset) {
-          if (tryServeStaticFile(LAB_ASSETS_ROOT, normalized.labAssetRelPath, res)) {
+          if (
+            tryServeStaticFile(LAB_ASSETS_ROOT, normalized.labAssetRelPath, res, req, {
+              rootKind: "lab",
+              publicPath: normalized.staticCandidatePath,
+            })
+          ) {
             return;
           }
-          res.statusCode = 404;
-          res.setHeader("Content-Type", "text/plain; charset=utf-8");
-          res.end("Asset not found");
+          writePlainStaticError(res, 404, "Asset not found", undefined, req.method);
           return;
         }
 
@@ -51,13 +55,8 @@ function squeekHatcheryPlugin(): Plugin {
         }
         next();
       } catch (err) {
-        res.statusCode = 500;
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.end(
-          JSON.stringify({
-            error: err instanceof Error ? err.message : "Middleware error",
-          }),
-        );
+        const message = err instanceof Error ? err.message : "Middleware error";
+        writePlainStaticError(res, 500, JSON.stringify({ error: message }), "application/json; charset=utf-8", req.method);
       }
     });
   };

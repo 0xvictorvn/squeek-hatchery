@@ -3,10 +3,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { privateKeyToAccount } from "viem/accounts";
+import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { createHatcheryHttpServer } from "../src/server.ts";
 import { measurementDayKey } from "../src/rules.ts";
 import { EXPERIMENTAL_POLICY_V2 } from "../src/game-policy.ts";
+import { shortWalletAddress } from "../src/led-session.ts";
 
 const CHROME_PATHS = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -217,9 +218,80 @@ const harnessClockBootstrapScript = (initialMs: number) => `
     lockedNowMs = ms;
     timersManual = false;
   };
+  window.__e2eHoldClockMs = (ms) => {
+    // Same locked server clock, but the real 200ms callback is suppressed.
+    // The fixture fires that stored callback once per ranked step.
+    lockedNowMs = ms;
+    timersManual = true;
+  };
+  window.__e2eFireHeartbeat = () => {
+    for (const item of [...intervals.values()]) {
+      if (item.delay === 200) item.fn(...item.args);
+    }
+  };
   window.__e2eAlignClock = (ms) => {
     lockedNowMs = null;
     offsetMs = ms - origDateNow();
+  };
+  window.__e2eLastHardwareObservedAt = 0;
+  window.__e2eLastApiTrace = "";
+  window.__e2eLastAimTrace = "";
+  window.__e2eLastTickTrace = "";
+  window.__e2eLastAimLamp = null;
+  window.__e2eLastTickElapsed = null;
+  window.__e2ePendingMutators = 0;
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const isAim = url.includes("/api/session/aim");
+    const isTick = url.includes("/api/session/tick");
+    const isStart = url.includes("/api/session/start");
+    const isHardware = url.includes("/api/hardware/status");
+    const mutator = isAim || isTick || isStart;
+    if (mutator) window.__e2ePendingMutators += 1;
+    try {
+      const res = await origFetch(input, init);
+      try {
+        if (isHardware || mutator) {
+          let observedAt = NaN;
+          let lamp = "none";
+          let elapsed = "none";
+          if (res.ok) {
+            const data = await res.clone().json();
+            observedAt = Number(data && data.reading && data.reading.observedAt);
+            if (Number.isFinite(observedAt)) window.__e2eLastHardwareObservedAt = observedAt;
+            const session = data && data.session;
+            if (session && Number.isFinite(Number(session.lampPosition))) lamp = String(session.lampPosition);
+            if (session && Number.isFinite(Number(session.elapsed))) elapsed = String(session.elapsed);
+            if (isAim && session && Number.isFinite(Number(session.lampPosition))) {
+              window.__e2eLastAimLamp = Number(session.lampPosition);
+            }
+            if (isTick && session && Number.isFinite(Number(session.elapsed))) {
+              window.__e2eLastTickElapsed = Number(session.elapsed);
+            }
+          }
+          const path = url.slice(Math.max(0, url.indexOf("/api/")));
+          const line =
+            path +
+            " " +
+            res.status +
+            " obs=" +
+            (Number.isFinite(observedAt) ? observedAt : "none") +
+            " lamp=" +
+            lamp +
+            " elapsed=" +
+            elapsed;
+          window.__e2eLastApiTrace = line;
+          if (isAim) window.__e2eLastAimTrace = line;
+          if (isTick) window.__e2eLastTickTrace = line;
+        }
+      } catch (err) {
+        // Keep the original response for the app if tracing fails.
+      }
+      return res;
+    } finally {
+      if (mutator) window.__e2ePendingMutators -= 1;
+    }
   };
 
   window.__e2eHarnessStepMs = async (totalMs, stepMs = 200) => {
@@ -267,6 +339,9 @@ async function openCdpPage(
   await session.send("DOM.enable");
   if (options.blockedUrls && options.blockedUrls.length > 0) {
     await session.send("Network.enable");
+    // This target shares the browser HTTP cache with the pages that already loaded art.
+    // Ignore that cache before navigation so the block applies to the real asset request.
+    await session.send("Network.setCacheDisabled", { cacheDisabled: true });
     await session.send("Network.setBlockedURLs", { urls: options.blockedUrls });
   }
   if (options.harnessClockMs !== undefined) {
@@ -307,8 +382,15 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
   let hardwareMode: "healthy" | "stall" | "replay_older" | "stale" = "healthy";
   let lastHealthyObservedAt = nowMs;
 
+  // V2 fixed-step schedules keep Eclipse Mask at accessory index 7 for 400 work.
+  // Interruption flags follow the current product: no manual pause, and a restart clears the attempt.
   const { backend, server } = createHatcheryHttpServer({
-    policy: EXPERIMENTAL_POLICY_V2,
+    policy: {
+      ...EXPERIMENTAL_POLICY_V2,
+      allowsManualPause: false,
+      clearLocksOnRestart: true,
+      activityGapResetsAttempt: true,
+    },
     dbPath: ":memory:",
     now: () => nowMs,
     hardwareTimeoutMs: 400,
@@ -408,6 +490,29 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     await waitForCondition(page, `document.getElementById("led-stage-canvas") !== null`);
     await waitForCondition(page, `document.getElementById("btn-start-lamp") !== null`);
 
+    const illuminationRunning =
+      `document.getElementById("led-stage-canvas").dataset.sessionStatus === "running"` +
+      ` && document.getElementById("btn-restart-attempt") !== null` +
+      ` && document.getElementById("btn-pause-lamp") === null` +
+      ` && document.getElementById("btn-start-lamp") === null`;
+
+    const claimEgg = async () => {
+      await page.eval(`document.getElementById("btn-confirm-egg").click()`);
+      await waitForCondition(
+        page,
+        `document.getElementById("species-selector-container").hidden === true`,
+      );
+    };
+
+    const startIllumination = async () => {
+      const needsClaim = await page.eval<boolean>(
+        `document.getElementById("species-selector-container").hidden === false`,
+      );
+      if (needsClaim) await claimEgg();
+      await page.eval(`document.getElementById("btn-start-lamp").click()`);
+      await waitForCondition(page, illuminationRunning, 15000);
+    };
+
     // R13 Check: Production app does not expose __squeekDebug or advanceGuestSeconds
     const hasDebugGlobal = await page.eval<boolean>(
       `typeof window.__squeekDebug !== "undefined"`,
@@ -463,15 +568,14 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     await page.eval(`window.location.hash = "#play"`);
     await waitForCondition(page, `document.getElementById("view-play").hidden === false`);
 
-    // 2. R11 Check: Stalled hardware telemetry expires after 15s and pauses Guest growth,
-    // rejects older replay / stale readings after outage, and recovers on fresh sample
+    // 2. R11 Check: stalled hardware expires after 15s and resets the Guest attempt,
+    // rejects older replay / stale readings after outage, and recovers on a fresh sample.
     await waitForCondition(
       page,
       `document.getElementById("telemetry-badge").textContent.includes("ACTIVE")`,
     );
     await page.eval(`window.__e2eSetClockMs(${nowMs})`);
-    await page.eval(`document.getElementById("btn-start-lamp").click()`);
-    await waitForCondition(page, `document.getElementById("btn-pause-lamp") !== null`, 15000);
+    await startIllumination();
 
     // Advance 2.0s while telemetry is still fresh
     nowMs += 2_000;
@@ -486,22 +590,31 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     nowMs += 14_000;
     await page.eval(`window.__e2eHarnessStepMs(14000, 200)`);
 
-    // Guest illumination must pause automatically at <= 15.0s and badge must show SIGNAL UNAVAILABLE · PAUSED
+    // Freshness expiry clears the unfinished Guest attempt. The badge still reports the signal outage.
     const stateAfterExpiry = await page.eval<{
       badgeText: string;
       sessionStatus: string;
       elapsedSec: number;
       startBtnVisible: boolean;
+      stageAcc: number;
+      stageBg: number;
+      lockedAcc: number;
     }>(`({
       badgeText: document.getElementById("telemetry-badge").textContent,
       sessionStatus: document.getElementById("led-stage-canvas").dataset.sessionStatus,
       elapsedSec: parseFloat(document.getElementById("timer-readout").textContent),
-      startBtnVisible: document.getElementById("btn-start-lamp") !== null
+      startBtnVisible: document.getElementById("btn-start-lamp") !== null,
+      stageAcc: Number(document.getElementById("led-stage-canvas").dataset.stageAccessory),
+      stageBg: Number(document.getElementById("led-stage-canvas").dataset.stageBackground),
+      lockedAcc: Number(document.getElementById("led-stage-canvas").dataset.lockedAccessory)
     })`);
     assert.match(stateAfterExpiry.badgeText, /SIGNAL UNAVAILABLE/i);
-    assert.equal(stateAfterExpiry.sessionStatus, "paused");
-    assert.ok(stateAfterExpiry.elapsedSec <= 15.0);
+    assert.equal(stateAfterExpiry.sessionStatus, "egg");
+    assert.equal(stateAfterExpiry.elapsedSec, 0);
     assert.equal(stateAfterExpiry.startBtnVisible, true);
+    assert.equal(stateAfterExpiry.stageAcc, -1);
+    assert.equal(stateAfterExpiry.stageBg, -1);
+    assert.equal(stateAfterExpiry.lockedAcc, -1);
 
     // Advancing another 8s while expired must NOT add any Guest growth
     nowMs += 8_000;
@@ -569,9 +682,6 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     assert.notEqual(lampBeforeKey, lampAfterKey);
     assert.equal(lampAfterKey, "0");
 
-    // Aim back to Head (-70)
-    await page.eval(`document.querySelector('[data-aim-region="0"]').click()`);
-
     // R9 Check in EGG state: accessory === -1, background === -1
     const eggStage = await page.eval<{ accessory: number; background: number }>(`({
       accessory: Number(document.getElementById("led-stage-canvas").dataset.stageAccessory),
@@ -580,9 +690,10 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     assert.equal(eggStage.accessory, -1);
     assert.equal(eggStage.background, -1);
 
-    // Start Guest lamp illumination
-    await page.eval(`document.getElementById("btn-start-lamp").click()`);
-    await waitForCondition(page, `document.getElementById("btn-pause-lamp") !== null`, 15000);
+    // Claim the selected egg, aim Head on that egg, then start illumination.
+    await claimEgg();
+    await page.eval(`document.querySelector('[data-region-card="0"]').click()`);
+    await startIllumination();
 
     // R2 & R9 Check in RUNNING state: lockedAccessory is 7, but stage still has accessory: -1, background: -1, and no early complete button
     const runningCheck = await page.eval<{
@@ -601,20 +712,48 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     assert.equal(runningCheck.stageBg, -1);
     assert.equal(runningCheck.completeBtnExists, false);
 
-    // R9 Check in PAUSED state: pause lamp, verify stage still hides accessory and background
-    await page.eval(`document.getElementById("btn-pause-lamp").click()`);
-    await waitForCondition(page, `document.getElementById("btn-start-lamp") !== null`);
-    const pausedStage = await page.eval<{ accessory: number; background: number }>(`({
-      accessory: Number(document.getElementById("led-stage-canvas").dataset.stageAccessory),
-      background: Number(document.getElementById("led-stage-canvas").dataset.stageBackground)
-    })`);
-    assert.equal(pausedStage.accessory, -1);
-    assert.equal(pausedStage.background, -1);
-
-    // Resume Guest illumination and step through all 3 regions (20s each = 60s total)
-    await page.eval(`document.getElementById("btn-start-lamp").click()`);
-    await waitForCondition(page, `document.getElementById("btn-pause-lamp") !== null`, 15000);
-
+    // Manual Pause/Resume is not a control. Egg, running, and the hardware reset above
+    // keep accessory/background hidden; the 60s hold below checks that again before reveal.
+    // The real 3s producer cannot follow these synthetic jumps. Stop it so each hardware
+    // request samples now(), and wait until the app ingests that sample. Outage checks above
+    // already ran against the background producer.
+    backend.stopProducer();
+    const waitForGuestHardwareSample = async (expectedObservedAt: number) => {
+      const start = Date.now();
+      let last = "";
+      while (Date.now() - start < 4000) {
+        const snap = await page.eval<{
+          observedAt: number;
+          status: string;
+          badge: string;
+          elapsed: string;
+          levels: string;
+        }>(`({
+          observedAt: Number(window.__e2eLastHardwareObservedAt || 0),
+          status: document.getElementById("led-stage-canvas").dataset.sessionStatus || "",
+          badge: document.getElementById("telemetry-badge").textContent || "",
+          elapsed: document.getElementById("timer-readout").textContent || "",
+          levels: document.getElementById("led-stage-canvas").dataset.stageLevels || ""
+        })`);
+        last = JSON.stringify(snap);
+        if (snap.status === "egg") {
+          throw new Error(
+            `Guest attempt reset before hardware sample ${expectedObservedAt}: ${last}`,
+          );
+        }
+        if (
+          snap.observedAt >= expectedObservedAt &&
+          snap.badge.includes("ACTIVE") &&
+          (snap.status === "running" || snap.status === "paused")
+        ) {
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      throw new Error(
+        `Timed out waiting for hardware observedAt>=${expectedObservedAt}: ${last}`,
+      );
+    };
     const stepGuestWithFreshTelemetry = async (seconds: number) => {
       let rem = seconds;
       while (rem > 0) {
@@ -622,8 +761,7 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
         rem -= chunk;
         nowMs += chunk * 1000;
         await page.eval(`window.__e2eHarnessStepMs(${chunk * 1000}, 200)`);
-        // Allow background hardware poll to refresh reading with new nowMs
-        await new Promise((r) => setTimeout(r, 120));
+        await waitForGuestHardwareSample(nowMs);
       }
     };
 
@@ -635,7 +773,7 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     );
 
     // Aim at Middle (region 1) and run 20s
-    await page.eval(`document.querySelector('[data-aim-region="1"]').click()`);
+    await page.eval(`document.querySelector('[data-region-card="1"]').click()`);
     await stepGuestWithFreshTelemetry(20);
     assert.equal(
       await page.eval<string>(`document.getElementById("led-stage-canvas").dataset.stageLevels`),
@@ -643,7 +781,7 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     );
 
     // Aim at Lower (region 2) and run final 20s -> reaches 60.0s / 60s and shows #btn-complete-session
-    await page.eval(`document.querySelector('[data-aim-region="2"]').click()`);
+    await page.eval(`document.querySelector('[data-region-card="2"]').click()`);
     await stepGuestWithFreshTelemetry(20);
 
     await waitForCondition(page, `document.getElementById("btn-complete-session") !== null`);
@@ -768,9 +906,7 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     }
 
     // 5. SIWE Login + Ranked 60s Session + Direct /result/<resultId> deep-link (C1/R7) + Display Name Clear (R8)
-    const walletAccount = privateKeyToAccount(
-      "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
-    );
+    const walletAccount = privateKeyToAccount(generatePrivateKey());
 
     await page.send("Runtime.addBinding", { name: "__e2eSignRequest" });
     await page.eval(`
@@ -840,9 +976,8 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
       `document.getElementById("auth-bar").textContent.includes("OrbitPilot")`,
     );
 
-    // Start Ranked illumination (aimed at Head = -70)
-    await page.eval(`document.getElementById("btn-start-lamp").click()`);
-    await waitForCondition(page, `document.getElementById("btn-pause-lamp") !== null`, 15000);
+    // Claim the Ranked egg and start illumination (Head = -70).
+    await startIllumination();
 
     // Verify Ranked R9 during running: accessory === -1, background === -1
     const rankedRunningStage = await page.eval<{ accessory: number; background: number }>(`({
@@ -852,57 +987,245 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     assert.equal(rankedRunningStage.accessory, -1);
     assert.equal(rankedRunningStage.background, -1);
 
-    // R11 Ranked tick error check: when telemetry stalls during Ranked play, /api/session/tick returns 503,
-    // client synchronizes UI to paused state without unhandled rejection, and recovers when telemetry returns
+    const readRankedFixtureState = async () =>
+      page.eval<{
+        observedAt: number;
+        status: string;
+        badge: string;
+        elapsed: string;
+        levels: string;
+        startVisible: boolean;
+        trace: string;
+        pending: number;
+        lamp: number;
+        pressedRegion: string;
+        aimTrace: string;
+        tickTrace: string;
+        aimLamp: number | null;
+        serverElapsed: number | null;
+      }>(`({
+        observedAt: Number(window.__e2eLastHardwareObservedAt || 0),
+        status: document.getElementById("led-stage-canvas").dataset.sessionStatus || "",
+        badge: document.getElementById("telemetry-badge").textContent || "",
+        elapsed: document.getElementById("timer-readout").textContent || "",
+        levels: document.getElementById("led-stage-canvas").dataset.stageLevels || "",
+        startVisible: document.getElementById("btn-start-lamp") !== null,
+        trace: String(window.__e2eLastApiTrace || ""),
+        pending: Number(window.__e2ePendingMutators || 0),
+        lamp: Number(document.getElementById("lamp").value),
+        pressedRegion: document.querySelector('[data-region-card][aria-pressed="true"]')?.getAttribute("data-region-card") || "",
+        aimTrace: String(window.__e2eLastAimTrace || ""),
+        tickTrace: String(window.__e2eLastTickTrace || ""),
+        aimLamp: window.__e2eLastAimLamp === null || window.__e2eLastAimLamp === undefined ? null : Number(window.__e2eLastAimLamp),
+        serverElapsed: window.__e2eLastTickElapsed === null || window.__e2eLastTickElapsed === undefined ? null : Number(window.__e2eLastTickElapsed)
+      })`);
+
+    // R11 Ranked tick error: the stopped producer will keep serving the last healthy sample
+    // until synthetic now moves. Advance past the 15s TTL so the heartbeat must poll, the
+    // stall returns 503, and the unfinished attempt resets on the same egg.
     hardwareMode = "stall";
-    await waitForCondition(
-      page,
-      `document.getElementById("led-stage-canvas").dataset.sessionStatus === "paused" && document.getElementById("btn-start-lamp") !== null`,
-      6000,
-    );
-    const rankedPausedByFault = await page.eval<{
+    nowMs += 16_000;
+    await alignBrowserClock();
+    {
+      const started = Date.now();
+      let last = "";
+      let reset = false;
+      while (Date.now() - started < 6000) {
+        const snap = await readRankedFixtureState();
+        last = JSON.stringify({ ...snap, serverNow: nowMs });
+        if (snap.status === "egg" && snap.startVisible) {
+          reset = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      if (!reset) {
+        throw new Error(`Ranked stall did not reset the attempt: ${last}`);
+      }
+    }
+    const rankedResetByFault = await page.eval<{
       badgeText: string;
       toastText: string;
       elapsedSec: number;
+      sessionStatus: string;
     }>(`({
       badgeText: document.getElementById("telemetry-badge").textContent,
       toastText: document.getElementById("status-toast").textContent,
-      elapsedSec: parseFloat(document.getElementById("timer-readout").textContent)
+      elapsedSec: parseFloat(document.getElementById("timer-readout").textContent),
+      sessionStatus: document.getElementById("led-stage-canvas").dataset.sessionStatus
     })`);
-    assert.match(rankedPausedByFault.badgeText, /SIGNAL UNAVAILABLE/i);
-    assert.ok(rankedPausedByFault.toastText.length > 0);
-    assert.equal(rankedPausedByFault.elapsedSec, 0);
+    assert.match(rankedResetByFault.badgeText, /SIGNAL UNAVAILABLE/i);
+    assert.ok(rankedResetByFault.toastText.length > 0);
+    assert.equal(rankedResetByFault.elapsedSec, 0);
+    assert.equal(rankedResetByFault.sessionStatus, "egg");
 
-    // Restore healthy telemetry and resume Ranked session
+    // Restore healthy telemetry and start the same Ranked egg again.
     hardwareMode = "healthy";
     nowMs += 1_000;
     await alignBrowserClock();
-    await page.eval(`document.getElementById("btn-start-lamp").click()`);
-    await waitForCondition(page, `document.getElementById("btn-pause-lamp") !== null`, 15000);
-
-    // Advance 3 x 20s steps across Head (-70), Middle (0), Lower (70) -> auto-completes at 60s!
-    nowMs += 20_000;
-    await alignBrowserClock();
-    await page.eval(`document.querySelector('[data-aim-region="1"]').click()`);
     await waitForCondition(
       page,
-      `document.getElementById("led-stage-canvas").dataset.stageLevels === "10,0,0"`,
+      `document.getElementById("btn-start-lamp") !== null && document.getElementById("btn-start-lamp").disabled === false && document.getElementById("ranked-reconnect-status") === null`,
+      8000,
     );
+    await startIllumination();
+    // Suppress the real 200ms callback so a tick cannot stay in flight across an aim.
+    // The production interval is unchanged; the fixture fires that same callback once per step.
+    await page.eval(`window.__e2eHoldClockMs(${nowMs})`);
 
-    nowMs += 20_000;
-    await alignBrowserClock();
-    await page.eval(`document.querySelector('[data-aim-region="2"]').click()`);
-    await waitForCondition(
-      page,
-      `document.getElementById("led-stage-canvas").dataset.stageLevels === "10,10,0"`,
-    );
+    const rankedDiag = (
+      snap: Awaited<ReturnType<typeof readRankedFixtureState>>,
+      extra: Record<string, unknown> = {},
+    ) => JSON.stringify({ ...snap, serverNow: nowMs, ...extra });
 
-    nowMs += 20_000;
-    await alignBrowserClock();
+    const waitRankedIdle = async () => {
+      const started = Date.now();
+      let last = "";
+      while (Date.now() - started < 4000) {
+        const snap = await readRankedFixtureState();
+        last = rankedDiag(snap);
+        if (snap.status === "egg") {
+          throw new Error(`Ranked attempt reset while draining mutators: ${last}`);
+        }
+        if (snap.pending === 0) {
+          await page.eval(`new Promise((r) => setTimeout(r, 0))`);
+          const settled = await readRankedFixtureState();
+          if (settled.pending === 0 && settled.status !== "egg") return settled;
+          last = rankedDiag(settled);
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      throw new Error(`Ranked mutators stayed in flight: ${last}`);
+    };
+
+    // 5s steps stay inside the 15s freshness TTL and the 20s ranked step limit.
+    // Each step drains the previous tick, then fires one 200ms heartbeat and waits for that response to be applied.
+    const advanceRankedPlay = async (totalMs: number) => {
+      let remaining = totalMs;
+      while (remaining > 0) {
+        const chunk = Math.min(5_000, remaining);
+        remaining -= chunk;
+        const drained = await waitRankedIdle();
+        const observedServerElapsed = drained.serverElapsed;
+        const observedUiElapsed = parseFloat(drained.elapsed);
+        let baseline = 0;
+        if (observedServerElapsed !== null && Number.isFinite(observedServerElapsed)) {
+          baseline = observedServerElapsed;
+        } else if (Number.isFinite(observedUiElapsed)) {
+          baseline = observedUiElapsed;
+        }
+        const targetElapsed = baseline + chunk / 1000;
+        const beforeTick = drained.tickTrace;
+        nowMs += chunk;
+        await page.eval(`window.__e2eHoldClockMs(${nowMs})`);
+        await page.eval(`window.__e2eFireHeartbeat()`);
+        const started = Date.now();
+        let last = "";
+        let delivered = false;
+        while (Date.now() - started < 4000) {
+          const snap = await readRankedFixtureState();
+          last = rankedDiag(snap, { targetElapsed, beforeTick });
+          if (snap.status === "egg") {
+            throw new Error(`Ranked attempt reset during healthy play at ${nowMs}: ${last}`);
+          }
+          const tickAck =
+            snap.pending === 0 &&
+            snap.tickTrace !== beforeTick &&
+            snap.tickTrace.includes("/api/session/tick") &&
+            snap.tickTrace.includes(" 200 ") &&
+            snap.serverElapsed === targetElapsed &&
+            snap.observedAt >= nowMs &&
+            snap.badge.includes("ACTIVE") &&
+            (snap.status === "running" || snap.status === "completed") &&
+            parseFloat(snap.elapsed) === targetElapsed;
+          if (tickAck) {
+            await page.eval(`new Promise((r) => setTimeout(r, 0))`);
+            const settled = await readRankedFixtureState();
+            if (
+              settled.pending === 0 &&
+              settled.serverElapsed === targetElapsed &&
+              settled.status !== "egg" &&
+              parseFloat(settled.elapsed) === targetElapsed
+            ) {
+              delivered = true;
+              break;
+            }
+            last = rankedDiag(settled, { targetElapsed, beforeTick });
+          }
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        if (!delivered) {
+          throw new Error(
+            `Ranked heartbeat was not applied (pending, elapsed, lamp, status): ${last}`,
+          );
+        }
+      }
+    };
+    const aimRankedRegion = async (region: 1 | 2) => {
+      const expectedLamp = region === 1 ? 0 : 70;
+      await waitRankedIdle();
+      const before = await readRankedFixtureState();
+      await page.eval(`document.querySelector('[data-region-card="${region}"]').click()`);
+      const started = Date.now();
+      let last = "";
+      while (Date.now() - started < 4000) {
+        const snap = await readRankedFixtureState();
+        last = rankedDiag(snap, { region, expectedLamp });
+        if (snap.status === "egg") {
+          throw new Error(`Ranked aim ${region} reset the attempt: ${last}`);
+        }
+        const aimAck =
+          snap.pending === 0 &&
+          snap.aimTrace !== before.aimTrace &&
+          snap.aimTrace.includes("/api/session/aim") &&
+          snap.aimTrace.includes(" 200 ") &&
+          snap.aimLamp === expectedLamp &&
+          snap.pressedRegion === String(region) &&
+          snap.status === "running";
+        if (aimAck) {
+          await page.eval(`new Promise((r) => setTimeout(r, 0))`);
+          const settled = await readRankedFixtureState();
+          if (
+            settled.pending === 0 &&
+            settled.aimLamp === expectedLamp &&
+            settled.pressedRegion === String(region) &&
+            settled.status === "running"
+          ) {
+            return;
+          }
+          last = rankedDiag(settled, { region, expectedLamp });
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      throw new Error(
+        `Ranked aim ${region} was not acknowledged (pending, elapsed, lamp, status, selected aim): ${last}`,
+      );
+    };
+    const assertRankedProgress = async (elapsedSeconds: number, levels: string) => {
+      const snap = await readRankedFixtureState();
+      const detail = rankedDiag(snap, { elapsedSeconds, levels });
+      assert.equal(snap.levels, levels, detail);
+      assert.equal(snap.serverElapsed, elapsedSeconds, detail);
+      assert.equal(parseFloat(snap.elapsed), elapsedSeconds, detail);
+      assert.notEqual(snap.status, "egg", detail);
+    };
+
+    // 20s on Head, then Middle, then Lower. The production heartbeat interval stays 200ms.
+    await advanceRankedPlay(20_000);
+    await assertRankedProgress(20, "10,0,0");
+    await aimRankedRegion(1);
+    await advanceRankedPlay(20_000);
+    await assertRankedProgress(40, "10,10,0");
+    await aimRankedRegion(2);
+    await advanceRankedPlay(20_000);
+    await assertRankedProgress(60, "10,10,10");
     await waitForCondition(page, `document.getElementById("result-panel").hidden === false`, 10000);
+    await page.eval(`document.querySelector('a[data-nav="leaderboard"]').click()`);
+    await waitForCondition(page, `document.getElementById("view-leaderboard").hidden === false`);
+    await page.eval(`document.getElementById("btn-refresh-lb-full").click()`);
     await waitForCondition(
       page,
-      `document.querySelectorAll(".led-lb-row").length === 1`,
+      `document.querySelectorAll("#full-leaderboard-container .led-lb-row").length === 1`,
     );
 
     // Verify Ranked R9 after completion: stage reveals locked accessory (7) and assigned background (>= 0)
@@ -914,8 +1237,8 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     }>(`({
       accessory: Number(document.getElementById("led-stage-canvas").dataset.stageAccessory),
       background: Number(document.getElementById("led-stage-canvas").dataset.stageBackground),
-      resultId: document.querySelector(".led-lb-row").dataset.resultId,
-      viewLinkHref: document.querySelector(".led-lb-view-link").getAttribute("href")
+      resultId: document.querySelector("#full-leaderboard-container .led-lb-row").dataset.resultId,
+      viewLinkHref: document.querySelector("#full-leaderboard-container .led-lb-view-link").getAttribute("href")
     })`);
     assert.equal(rankedCompletedStage.accessory, 7);
     assert.ok(rankedCompletedStage.background >= 0);
@@ -952,10 +1275,11 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     );
 
     const nftMetaText = await viewerPage.eval<string>(
-      `document.getElementById("nft-detail-meta").innerText`,
+      `[document.getElementById("nft-detail-meta").innerText, document.getElementById("nft-view-title").textContent].join("\\n")`,
     );
+    const publicShortWallet = shortWalletAddress(walletAccount.address);
     assert.match(nftMetaText, /OrbitPilot/);
-    assert.match(nftMetaText, new RegExp(walletAccount.address, "i"));
+    assert.equal(nftMetaText.includes(walletAccount.address), false);
 
     // Verify /nft/<resultId> compatibility alias also works directly
     const aliasPage = await openCdpPage(
@@ -968,19 +1292,29 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
     );
     aliasPage.close();
 
-    // R8 Check: Clear display name on Play page -> Leaderboard AND Public Result page revert to shortWallet
-    await page.eval(`(() => {
-      const inp = document.getElementById("display-name-input");
-      inp.value = "";
-      document.getElementById("display-name-form").requestSubmit();
-    })()`);
+    // R8: the visible account menu Clear control drops the custom name.
+    // Leaderboard refresh only runs on that route, so wait for this result's row to show the short wallet.
+    await page.eval(`document.getElementById("btn-account-toggle").click()`);
     await waitForCondition(
       page,
-      `!document.getElementById("auth-bar").textContent.includes("OrbitPilot")`,
+      `document.getElementById("account-popover").hidden === false && document.querySelector("#account-popover #btn-clear-name") !== null`,
+    );
+    await page.eval(`document.querySelector("#account-popover #btn-clear-name").click()`);
+    await waitForCondition(
+      page,
+      `!document.getElementById("auth-bar").textContent.includes("OrbitPilot") && document.getElementById("auth-bar").textContent.includes(${JSON.stringify(publicShortWallet)})`,
     );
     await waitForCondition(
       page,
-      `!(document.getElementById("full-leaderboard-container") || document.getElementById("play-leaderboard-container"))?.innerText?.includes("OrbitPilot")`,
+      `(() => {
+        const row = document.querySelector("#full-leaderboard-container .led-lb-row");
+        const text = row ? row.innerText : "";
+        return Boolean(row)
+          && row.dataset.resultId === ${JSON.stringify(rankedResultId)}
+          && text.includes(${JSON.stringify(publicShortWallet)})
+          && !text.includes("OrbitPilot")
+          && !text.includes(${JSON.stringify(walletAccount.address)});
+      })()`,
     );
 
     await reloadCdpPage(viewerPage);
@@ -989,10 +1323,11 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
       `document.getElementById("nft-detail-grid").hidden === false`,
     );
     const nftMetaAfterClear = await viewerPage.eval<string>(
-      `document.getElementById("nft-detail-meta").innerText`,
+      `[document.getElementById("nft-detail-meta").innerText, document.getElementById("nft-view-title").textContent].join("\\n")`,
     );
-    assert.doesNotMatch(nftMetaAfterClear, /OrbitPilot/);
-    assert.match(nftMetaAfterClear, new RegExp(walletAccount.address.slice(0, 6), "i"));
+    assert.equal(nftMetaAfterClear.includes("OrbitPilot"), false);
+    assert.equal(nftMetaAfterClear.includes(publicShortWallet), true);
+    assert.equal(nftMetaAfterClear.includes(walletAccount.address), false);
 
     assert.equal(page.pageErrors.length, 0, `Unexpected page errors: ${page.pageErrors.join("; ")}`);
     assert.equal(
@@ -1001,32 +1336,49 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
       `Unexpected viewer page errors: ${viewerPage.pageErrors.join("; ")}`,
     );
 
-    // 6. Test all 3 families (Pulse, Relay, Prism) on stage
-    const rendererMatrix = await page.eval<{
-      family0Ok: boolean;
-      family1Ok: boolean;
-      family2Ok: boolean;
-      mixedOk: boolean;
-    }>(`(async () => {
-      const results = [];
-      for (const famBtnId of ["species-btn-pulse", "species-btn-relay", "species-btn-prism"]) {
-        document.getElementById("btn-reset-egg").click();
-        await new Promise((r) => setTimeout(r, 120));
-        document.getElementById(famBtnId).click();
-        await new Promise((r) => setTimeout(r, 120));
-        const c = document.getElementById("led-stage-canvas");
-        const data = c.getContext("2d").getImageData(500, 500, 600, 600).data;
-        let lit = 0;
-        for (let i = 3; i < data.length; i += 4) if (data[i] > 0) lit++;
-        results.push(lit > 5000);
-      }
-      return {
-        family0Ok: results[0],
-        family1Ok: results[1],
-        family2Ok: results[2],
-        mixedOk: results.every(Boolean),
-      };
-    })()`);
+    await page.eval(`document.querySelector('a[data-nav="play"]').click()`);
+    await waitForCondition(page, `document.getElementById("view-play").hidden === false`);
+
+    // 6. Test all 3 families (Pulse, Relay, Prism) on stage.
+    // Reset returns to species selection; Demo is the signed-in switch. Species controls stay disabled while an egg is confirmed.
+    await page.eval(`document.getElementById("btn-reset-egg").click()`);
+    await waitForCondition(
+      page,
+      `document.getElementById("species-selector-container").hidden === false && document.getElementById("species-btn-pulse").disabled === false && document.getElementById("led-stage-canvas").dataset.sessionStatus === "egg" && document.getElementById("led-stage-canvas").dataset.stageFamily === "0"`,
+    );
+    await page.eval(`document.getElementById("btn-mode-demo").click()`);
+    await waitForCondition(
+      page,
+      `document.getElementById("btn-mode-demo").className.includes("active") && document.getElementById("session-mode-badge").textContent.includes("DEMO MODE") && document.getElementById("species-selector-container").hidden === false`,
+    );
+    const rendererMatrix = {
+      family0Ok: false,
+      family1Ok: false,
+      family2Ok: false,
+      mixedOk: false,
+    };
+    const familySelections = [
+      { id: "species-btn-pulse", family: "0", key: "family0Ok" },
+      { id: "species-btn-relay", family: "1", key: "family1Ok" },
+      { id: "species-btn-prism", family: "2", key: "family2Ok" },
+    ] as const;
+    for (const spec of familySelections) {
+      await page.eval(`document.getElementById(${JSON.stringify(spec.id)}).click()`);
+      await waitForCondition(
+        page,
+        `document.getElementById(${JSON.stringify(spec.id)}).disabled === false && document.getElementById(${JSON.stringify(spec.id)}).getAttribute("aria-checked") === "true" && document.getElementById("led-stage-canvas").dataset.stageFamily === ${JSON.stringify(spec.family)}`,
+      );
+      const lit = await page.eval<number>(`(() => {
+        const canvas = document.getElementById("led-stage-canvas");
+        const data = canvas.getContext("2d").getImageData(500, 500, 600, 600).data;
+        let count = 0;
+        for (let i = 3; i < data.length; i += 4) if (data[i] > 0) count++;
+        return count;
+      })()`);
+      rendererMatrix[spec.key] = lit > 5000;
+    }
+    rendererMatrix.mixedOk =
+      rendererMatrix.family0Ok && rendererMatrix.family1Ok && rendererMatrix.family2Ok;
     assert.equal(rendererMatrix.family0Ok, true);
     assert.equal(rendererMatrix.family1Ok, true);
     assert.equal(rendererMatrix.family2Ok, true);
@@ -1045,10 +1397,19 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
 
     await assetRecoveryPage.eval(`
       window.__exportedBlobSize = 0;
+      window.__exportedPngWidth = 0;
+      window.__exportedPngHeight = 0;
       const origCreateObjectURL = URL.createObjectURL.bind(URL);
       URL.createObjectURL = (blob) => {
         if (blob instanceof Blob) {
           window.__exportedBlobSize = blob.size;
+          blob.arrayBuffer().then((buf) => {
+            const view = new DataView(buf);
+            if (buf.byteLength >= 24 && view.getUint32(0) === 0x89504e47) {
+              window.__exportedPngWidth = view.getUint32(16);
+              window.__exportedPngHeight = view.getUint32(20);
+            }
+          });
         }
         return origCreateObjectURL(blob);
       };
@@ -1059,11 +1420,21 @@ test("Real-browser E2E: Docs separation, R11 Guest telemetry stall/expiry/replay
       `document.getElementById("status-toast").hidden === false && /Asset load failure.*canonical 1600x1600 export blocked/i.test(document.getElementById("status-toast").textContent)`,
     );
     assert.equal(await assetRecoveryPage.eval<number>(`window.__exportedBlobSize`), 0);
+    assert.equal(await assetRecoveryPage.eval<number>(`window.__exportedPngWidth`), 0);
+    assert.equal(await assetRecoveryPage.eval<number>(`window.__exportedPngHeight`), 0);
 
     // Unblock /lab-assets/* and verify export recovers and produces a real 1600x1600 PNG Blob
     await assetRecoveryPage.send("Network.setBlockedURLs", { urls: [] });
-    await assetRecoveryPage.eval(`document.getElementById("btn-nft-export-png").click()`);
-    await waitForCondition(assetRecoveryPage, `window.__exportedBlobSize > 10000`);
+    await assetRecoveryPage.eval(`
+      window.__exportedBlobSize = 0;
+      window.__exportedPngWidth = 0;
+      window.__exportedPngHeight = 0;
+      document.getElementById("btn-nft-export-png").click();
+    `);
+    await waitForCondition(
+      assetRecoveryPage,
+      `window.__exportedPngWidth === 1600 && window.__exportedPngHeight === 1600 && window.__exportedBlobSize > 10000`,
+    );
     assetRecoveryPage.close();
 
     page.close();

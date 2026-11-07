@@ -3,6 +3,13 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HatcheryBackend, type BackendOptions } from "./backend.ts";
+import {
+  classifyStaticCache,
+  writePlainStaticError,
+  writeStaticBytes,
+  type StaticRootKind,
+  type StaticServeOptions,
+} from "./static-cache.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,32 +30,62 @@ const MIME_TYPES: Record<string, string> = {
   ".txt": "text/plain; charset=utf-8",
 };
 
+export interface HatcheryStaticRoots {
+  dist: string;
+  publicDir: string;
+  lab: string;
+  project: string;
+}
+
 export function tryServeStaticFile(
   rootDir: string,
   relativePath: string,
   res: ServerResponse,
+  req?: IncomingMessage,
+  options?: StaticServeOptions,
 ): boolean {
   const safeRel = relativePath.replace(/^[/\\]+/, "");
   const resolved = path.resolve(rootDir, safeRel);
   const rootWithSep = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
   if (resolved !== rootDir && !resolved.startsWith(rootWithSep)) {
-    res.statusCode = 403;
-    res.end("Forbidden");
+    writePlainStaticError(res, 403, "Forbidden", undefined, req?.method);
     return true;
   }
-  if (!fs.existsSync(resolved)) {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
     return false;
   }
-  const stat = fs.statSync(resolved);
-  if (!stat.isFile()) {
-    return false;
-  }
+  if (!stat.isFile()) return false;
+  const bytes = fs.readFileSync(resolved);
   const ext = path.extname(resolved).toLowerCase();
-  res.statusCode = 200;
-  res.setHeader("Content-Type", MIME_TYPES[ext] ?? "application/octet-stream");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.end(fs.readFileSync(resolved));
+  const publicPath = options?.publicPath ?? `/${safeRel.split(path.sep).join("/")}`;
+  const policy = classifyStaticCache({
+    rootKind: options?.rootKind ?? "project",
+    publicPath,
+    method: req?.method ?? "GET",
+    spaDocument: options?.spaDocument,
+  });
+  const mtimeMs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : stat.mtime.getTime();
+  writeStaticBytes(req, res, bytes, mtimeMs, MIME_TYPES[ext] ?? "application/octet-stream", policy);
   return true;
+}
+
+function serveRoot(
+  req: IncomingMessage,
+  res: ServerResponse,
+  rootDir: string,
+  relativePath: string,
+  rootKind: StaticRootKind,
+  publicPath: string,
+  spaDocument = false,
+): boolean {
+  return tryServeStaticFile(rootDir, relativePath, res, req, {
+    rootKind,
+    publicPath,
+    spaDocument,
+  });
 }
 
 const STATIC_ASSET_EXT_RE =
@@ -104,10 +141,19 @@ export function normalizeNestedStaticPath(pathname: string): {
   };
 }
 
-export function createHatcheryHttpServer(options: BackendOptions = {}): {
+export function createHatcheryHttpServer(
+  options: BackendOptions = {},
+  staticRoots?: HatcheryStaticRoots,
+): {
   backend: HatcheryBackend;
   server: http.Server;
 } {
+  const roots = staticRoots ?? {
+    dist: DIST_ROOT,
+    publicDir: PUBLIC_ROOT,
+    lab: LAB_ASSETS_ROOT,
+    project: PROJECT_ROOT,
+  };
   const defaultDbPath = path.resolve(PROJECT_ROOT, "cache", "hatchery-backend.sqlite");
   const backend = new HatcheryBackend({
     autoStartProducer: true,
@@ -125,29 +171,32 @@ export function createHatcheryHttpServer(options: BackendOptions = {}): {
       const normalized = normalizeNestedStaticPath(pathname);
 
       if (normalized.isLabAsset) {
-        if (tryServeStaticFile(LAB_ASSETS_ROOT, normalized.labAssetRelPath, res)) return;
+        const publicPath = normalized.staticCandidatePath;
+        if (serveRoot(req, res, roots.lab, normalized.labAssetRelPath, "lab", publicPath)) return;
         if (
-          tryServeStaticFile(
-            path.join(DIST_ROOT, "lab-assets"),
-            normalized.labAssetRelPath,
+          serveRoot(
+            req,
             res,
+            path.join(roots.dist, "lab-assets"),
+            normalized.labAssetRelPath,
+            "dist",
+            publicPath,
           )
         ) {
           return;
         }
-        res.statusCode = 404;
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.end("Asset not found");
+        writePlainStaticError(res, 404, "Asset not found", undefined, req.method);
         return;
       }
 
       if (normalized.isAssetRequest) {
-        if (tryServeStaticFile(DIST_ROOT, normalized.staticCandidatePath, res)) return;
-        if (tryServeStaticFile(PUBLIC_ROOT, normalized.staticCandidatePath, res)) return;
-        if (tryServeStaticFile(PROJECT_ROOT, normalized.staticCandidatePath, res)) return;
-        res.statusCode = 404;
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.end("Static asset not found");
+        const publicPath = normalized.staticCandidatePath.startsWith("/")
+          ? normalized.staticCandidatePath
+          : `/${normalized.staticCandidatePath}`;
+        if (serveRoot(req, res, roots.dist, publicPath, "dist", publicPath)) return;
+        if (serveRoot(req, res, roots.publicDir, publicPath, "public", publicPath)) return;
+        if (serveRoot(req, res, roots.project, publicPath, "project", publicPath)) return;
+        writePlainStaticError(res, 404, "Static asset not found", undefined, req.method);
         return;
       }
 
@@ -161,23 +210,24 @@ export function createHatcheryHttpServer(options: BackendOptions = {}): {
         /^\/(?:result|nft)\/[^/]+\/?$/.test(pathname);
 
       if (!isSpaRoute) {
-        if (tryServeStaticFile(DIST_ROOT, pathname, res)) return;
-        if (tryServeStaticFile(PUBLIC_ROOT, pathname, res)) return;
+        const publicPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
+        if (serveRoot(req, res, roots.dist, pathname, "dist", publicPath)) return;
+        if (serveRoot(req, res, roots.publicDir, pathname, "public", publicPath)) return;
       }
 
-      // SPA fallback to dist/index.html or index.html for app routes
-      if (tryServeStaticFile(DIST_ROOT, "index.html", res)) return;
-      if (tryServeStaticFile(PROJECT_ROOT, "index.html", res)) return;
+      if (serveRoot(req, res, roots.dist, "index.html", "dist", "/index.html", true)) return;
+      if (serveRoot(req, res, roots.project, "index.html", "project", "/index.html", true)) return;
 
-      res.statusCode = 404;
-      res.end("Not found");
+      writePlainStaticError(res, 404, "Not found", undefined, req.method);
     } catch (err) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      res.end(
-        JSON.stringify({
-          error: err instanceof Error ? err.message : "Internal server error",
-        }),
+      if (res.headersSent) return;
+      const message = err instanceof Error ? err.message : "Internal server error";
+      writePlainStaticError(
+        res,
+        500,
+        JSON.stringify({ error: message }),
+        "application/json; charset=utf-8",
+        req.method,
       );
     }
   });

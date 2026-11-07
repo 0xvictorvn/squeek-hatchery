@@ -44,14 +44,21 @@ import {
   buildLedMetadataJson,
   clearAttemptProgressKeepingEgg,
   createLedSession,
+  decideRankedLampUpdate,
   formatEffectivePlayerName,
   lockSessionTraits,
+  rankedAttemptIsStale,
+  readRankedIntentOrder,
+  rotateRankedIntentOrder,
   sanitizePublicCharacterSnapshot,
   shortWalletAddress,
+  STALE_RANKED_INTENT_ERROR,
   stepLedSession,
   validatePlayerDisplayName,
   type CharacterSnapshot,
   type LedSession,
+  type RankedIntentOrder,
+  type RankedOrderCommand,
 } from "./led-session.ts";
 import {
   SignalError,
@@ -120,6 +127,9 @@ const FORBIDDEN_CLIENT_AUTHORITATIVE_KEYS = new Set([
   "seed",
   "completedAt",
   "resultId",
+  "intentOrder",
+  "revision",
+  "responseRevision",
 ]);
 
 export interface SerializedReading {
@@ -365,6 +375,33 @@ function resolveLampPositionFromInput(body: Record<string, unknown>, fallback = 
   return fallback;
 }
 
+function parseRankedOrderCommand(body: Record<string, unknown>): RankedOrderCommand {
+  const hasAttempt = Object.prototype.hasOwnProperty.call(body, "attemptId");
+  const hasIntent = Object.prototype.hasOwnProperty.call(body, "aimIntent");
+  if (!hasAttempt && !hasIntent) return { kind: "legacy" };
+  if (hasAttempt !== hasIntent) {
+    throw new HttpError(400, "Ranked ordering fields attemptId and aimIntent must be sent together.");
+  }
+  const attemptId = body.attemptId;
+  const aimIntent = body.aimIntent;
+  if (typeof attemptId !== "string" || !/^[A-Za-z0-9-]{8,80}$/.test(attemptId)) {
+    throw new HttpError(400, "Ranked ordering attemptId is malformed.");
+  }
+  if (
+    typeof aimIntent !== "number" ||
+    !Number.isSafeInteger(aimIntent) ||
+    aimIntent < 0 ||
+    aimIntent > 1_000_000_000
+  ) {
+    throw new HttpError(400, "Ranked ordering aimIntent is malformed.");
+  }
+  return { kind: "ordered", attemptId, aimIntent };
+}
+
+function freshRankedIntentOrder(attemptId: string): RankedIntentOrder {
+  return { attemptId, aimIntent: 0, revision: 0, adopted: false };
+}
+
 function resolveFamilyIndexFromInput(body: Record<string, unknown>): 0 | 1 | 2 {
   if (body.familyIndex === 0 || body.familyIndex === 1 || body.familyIndex === 2) {
     return body.familyIndex;
@@ -519,6 +556,17 @@ export class BestPerWalletWeeklyLeaderboardStrategy implements LeaderboardStrate
     return chosenRows.slice(0, limit);
   }
 }
+
+type RankedTelemetryFence = {
+  found: boolean;
+  sessionId: string | null;
+  attemptId: string | null;
+  aimIntent: number;
+  revision: number;
+  adopted: boolean;
+  requestAttemptId: string | null;
+  requestAimIntent: number | null;
+};
 
 export class HatcheryBackend {
   readonly db: DatabaseSync;
@@ -1297,33 +1345,204 @@ export class HatcheryBackend {
     return { remaining, total, completedToday, resetsAtUtc };
   }
 
+  private withImmediateTransaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+
+  private captureRankedFence(
+    walletAddress: string,
+    sessionIdParam: unknown,
+    command: RankedOrderCommand,
+  ): RankedTelemetryFence {
+    const requestAttemptId = command.kind === "ordered" ? command.attemptId : null;
+    const requestAimIntent = command.kind === "ordered" ? command.aimIntent : null;
+    const missed: RankedTelemetryFence = {
+      found: false,
+      sessionId: null,
+      attemptId: null,
+      aimIntent: 0,
+      revision: 0,
+      adopted: false,
+      requestAttemptId,
+      requestAimIntent,
+    };
+    try {
+      const row = this.resolveOwnedActiveSessionRow(walletAddress, sessionIdParam);
+      const order = readRankedIntentOrder(this.rowToSession(row).intentOrder);
+      if (rankedAttemptIsStale(order, command)) {
+        throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+      }
+      return {
+        found: true,
+        sessionId: String(row.session_id),
+        attemptId: order?.attemptId ?? null,
+        aimIntent: order?.aimIntent ?? 0,
+        revision: order?.revision ?? 0,
+        adopted: order?.adopted ?? false,
+        requestAttemptId,
+        requestAimIntent,
+      };
+    } catch (err) {
+      if (err instanceof HttpError && err.message === STALE_RANKED_INTENT_ERROR) throw err;
+      return missed;
+    }
+  }
+
+  private resetRankedAttemptIfUnchanged(
+    walletAddress: string,
+    sessionIdParam: unknown,
+    fence: RankedTelemetryFence,
+  ): void {
+    if (!fence.found) return;
+    try {
+      this.withImmediateTransaction(() => {
+        const row = this.resolveOwnedActiveSessionRow(walletAddress, sessionIdParam);
+        if (fence.sessionId !== String(row.session_id)) return;
+        const session = this.rowToSession(row);
+        if (session.status !== "running") return;
+        const order = readRankedIntentOrder(session.intentOrder);
+        if ((order?.attemptId ?? null) !== fence.attemptId) return;
+        if ((order?.aimIntent ?? 0) !== fence.aimIntent) return;
+        if ((order?.revision ?? 0) !== fence.revision) return;
+        if ((order?.adopted ?? false) !== fence.adopted) return;
+        if (fence.requestAttemptId !== null && fence.requestAttemptId !== (order?.attemptId ?? null)) return;
+        if (fence.requestAimIntent !== null && fence.requestAimIntent < (order?.aimIntent ?? 0)) return;
+        this.applyAttemptInterruption(session);
+        this.bumpRankedRevision(session);
+        this.saveSessionRow(session, null, Number(row.assigned_background_index));
+      });
+    } catch {
+      // The original telemetry error remains the caller-visible failure.
+    }
+  }
+
+  private clearRankedAttempt(session: LedSession): void {
+    clearAttemptProgressKeepingEgg(session);
+    session.intentOrder = rotateRankedIntentOrder(
+      readRankedIntentOrder(session.intentOrder),
+      `att-${randomUUID()}`,
+    );
+  }
+
+  private bumpRankedRevision(session: LedSession): void {
+    const order =
+      readRankedIntentOrder(session.intentOrder) ?? freshRankedIntentOrder(`att-${randomUUID()}`);
+    session.intentOrder = { ...order, revision: order.revision + 1 };
+  }
+
+  private requestedRankedLamp(body: Record<string, unknown>, fallback: number): number | null {
+    if (body.lampPosition === undefined && body.activeRegion === undefined) return null;
+    return resolveLampPositionFromInput(body, fallback);
+  }
+
+  private finishRankedLamp(
+    session: LedSession,
+    command: RankedOrderCommand,
+    body: Record<string, unknown>,
+    orderBefore: RankedIntentOrder | null,
+  ): void {
+    const after = readRankedIntentOrder(session.intentOrder);
+    const rotated = (orderBefore?.attemptId ?? null) !== (after?.attemptId ?? null) && after !== null;
+    const decision = decideRankedLampUpdate({
+      order: rotated ? orderBefore : (after ?? orderBefore),
+      command,
+      currentLamp: session.lampPosition,
+      requestedLamp: this.requestedRankedLamp(body, session.lampPosition),
+      assignAttemptId: () => `att-${randomUUID()}`,
+    });
+    if (!rotated && decision.staleAttempt) {
+      throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+    }
+    if (!decision.staleAttempt) {
+      session.lampPosition = decision.lampPosition;
+      if (!rotated) session.intentOrder = decision.order;
+    }
+    if (!readRankedIntentOrder(session.intentOrder)) {
+      session.intentOrder = decision.order;
+    }
+    this.bumpRankedRevision(session);
+  }
+
+  private applyRankedProgress(input: {
+    row: Record<string, unknown>;
+    session: LedSession;
+    sessionPolicy: GamePolicy;
+    nowMs: number;
+    telemetry: HardwareTelemetrySnapshot | null;
+    command: RankedOrderCommand;
+    body: Record<string, unknown>;
+    accrue: boolean;
+  }): { levelUps: { region: 0 | 1 | 2; previousLevel: number; newLevel: number }[] } {
+    const existing = readRankedIntentOrder(input.session.intentOrder);
+    if (rankedAttemptIsStale(existing, input.command)) {
+      throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+    }
+    const before = existing ? { ...existing } : null;
+    let levelUps: { region: 0 | 1 | 2; previousLevel: number; newLevel: number }[] = [];
+    if (input.accrue && input.session.status === "running" && input.telemetry) {
+      const stepped = this.advanceRunningSessionStep(
+        input.row,
+        input.session,
+        input.sessionPolicy,
+        input.nowMs,
+        input.telemetry,
+      );
+      levelUps = stepped.levelUps;
+    }
+    this.finishRankedLamp(input.session, input.command, input.body, before);
+    return { levelUps };
+  }
+
   async restartRankedSession(
     walletAddress: string,
     body: Record<string, unknown>,
   ): Promise<{ session: LedSession }> {
     this.assertNoClientAuthoritativeFields(body);
-    const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
-    if (String(row.status) === "completed") {
-      throw new HttpError(409, "Completed sessions cannot be restarted.");
-    }
-    const session = this.rowToSession(row);
-    // Current server rules clear locks on restart; older frozen policies may retain locks.
-    if (this.policy.clearLocksOnRestart) {
-      clearAttemptProgressKeepingEgg(session);
-    } else {
-      session.status = "egg";
-      session.elapsed = 0;
-      session.regions = [
-        { exposure: 0, dose: 0, continuousLevel: 0, level: 0 },
-        { exposure: 0, dose: 0, continuousLevel: 0, level: 0 },
-        { exposure: 0, dose: 0, continuousLevel: 0, level: 0 },
-      ];
-      session.completedAt = null;
-      session.backgroundIndex = null;
-      session.backgroundId = null;
-    }
-    this.saveSessionRow(session, null, Number(row.assigned_background_index));
-    return { session };
+    const command = parseRankedOrderCommand(body);
+    return this.withImmediateTransaction(() => {
+      const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
+      if (String(row.status) === "completed") {
+        throw new HttpError(409, "Completed sessions cannot be restarted.");
+      }
+      const session = this.rowToSession(row);
+      if (rankedAttemptIsStale(readRankedIntentOrder(session.intentOrder), command)) {
+        throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+      }
+      // Current server rules clear locks on restart; older frozen policies may retain locks.
+      if (this.policy.clearLocksOnRestart) {
+        this.clearRankedAttempt(session);
+      } else {
+        session.status = "egg";
+        session.elapsed = 0;
+        session.regions = [
+          { exposure: 0, dose: 0, continuousLevel: 0, level: 0 },
+          { exposure: 0, dose: 0, continuousLevel: 0, level: 0 },
+          { exposure: 0, dose: 0, continuousLevel: 0, level: 0 },
+        ];
+        session.completedAt = null;
+        session.backgroundIndex = null;
+        session.backgroundId = null;
+        session.intentOrder = rotateRankedIntentOrder(
+          readRankedIntentOrder(session.intentOrder),
+          `att-${randomUUID()}`,
+        );
+      }
+      this.bumpRankedRevision(session);
+      this.saveSessionRow(session, null, Number(row.assigned_background_index));
+      return { session };
+    });
   }
 
   ingestHardwareReading(
@@ -1951,14 +2170,8 @@ export class HatcheryBackend {
       const row = this.resolveOwnedActiveSessionRow(walletAddress, sessionIdParam);
       const session = this.rowToSession(row);
       if (session.status !== "running") return;
-      if (this.policy.activityGapResetsAttempt || this.policy.clearLocksOnRestart) {
-        clearAttemptProgressKeepingEgg(session);
-      } else {
-        session.status = "paused";
-        session.completedAt = null;
-        session.backgroundIndex = null;
-        session.backgroundId = null;
-      }
+      this.applyAttemptInterruption(session);
+      this.bumpRankedRevision(session);
       this.saveSessionRow(session, null, Number(row.assigned_background_index));
     } catch {
       // ignore if no active session
@@ -1980,13 +2193,17 @@ export class HatcheryBackend {
   private applyAttemptInterruption(session: LedSession): void {
     // Prefer current server anti-hoarding rules over legacy session pause retention.
     if (this.currentPolicyClearsUnfinishedLocks()) {
-      clearAttemptProgressKeepingEgg(session);
+      this.clearRankedAttempt(session);
       return;
     }
     session.status = "paused";
     session.completedAt = null;
     session.backgroundIndex = null;
     session.backgroundId = null;
+    session.intentOrder = rotateRankedIntentOrder(
+      readRankedIntentOrder(session.intentOrder),
+      `att-${randomUUID()}`,
+    );
   }
 
   /**
@@ -2004,7 +2221,7 @@ export class HatcheryBackend {
       session.startedAt !== null ||
       session.regions.some((region) => region.dose > 0 || region.level > 0 || region.exposure > 0);
     if (!holdsProgress) return false;
-    clearAttemptProgressKeepingEgg(session);
+    this.clearRankedAttempt(session);
     return true;
   }
 
@@ -2101,38 +2318,68 @@ export class HatcheryBackend {
     } catch {
       policySupported = false;
     }
-    if (session.status === "running") {
-      const nowMs = this.now();
-      const lastStepMs =
-        row.last_step_at_ms !== null && row.last_step_at_ms !== undefined
-          ? Number(row.last_step_at_ms)
-          : null;
-      let shouldPause =
-        !policySupported ||
-        lastStepMs === null ||
-        nowMs < lastStepMs ||
-        nowMs - lastStepMs > MAX_RANKED_STEP_MS;
-
-      if (!shouldPause) {
-        try {
-          await this.getHardwareTelemetry();
-        } catch {
-          shouldPause = true;
-        }
-      }
-
-      if (shouldPause) {
-        this.applyAttemptInterruption(session);
+    if (session.status !== "running") {
+      if (this.releaseUnfinishedHoardedLocks(session)) {
+        this.bumpRankedRevision(session);
         this.saveSessionRow(session, null, Number(row.assigned_background_index));
       }
-    } else if (this.releaseUnfinishedHoardedLocks(session)) {
-      this.saveSessionRow(session, null, Number(row.assigned_background_index));
+      return session;
     }
-    return session;
+
+    const nowMs = this.now();
+    const lastStepMs =
+      row.last_step_at_ms !== null && row.last_step_at_ms !== undefined
+        ? Number(row.last_step_at_ms)
+        : null;
+    const gapOrUnsupported =
+      !policySupported ||
+      lastStepMs === null ||
+      nowMs < lastStepMs ||
+      nowMs - lastStepMs > MAX_RANKED_STEP_MS;
+    if (gapOrUnsupported) {
+      this.applyAttemptInterruption(session);
+      this.bumpRankedRevision(session);
+      this.saveSessionRow(session, null, Number(row.assigned_background_index));
+      return session;
+    }
+
+    const order = readRankedIntentOrder(session.intentOrder);
+    const fence = {
+      sessionId: String(row.session_id),
+      attemptId: order?.attemptId ?? null,
+      revision: order?.revision ?? 0,
+    };
+    let telemetryFailed = false;
+    try {
+      await this.getHardwareTelemetry();
+    } catch {
+      telemetryFailed = true;
+    }
+
+    if (telemetryFailed) {
+      this.withImmediateTransaction(() => {
+        const currentRow = this.getActiveRankedSessionRow(walletAddress);
+        if (!currentRow) return;
+        const current = this.rowToSession(currentRow);
+        const currentOrder = readRankedIntentOrder(current.intentOrder);
+        if (String(currentRow.session_id) !== fence.sessionId) return;
+        if ((currentOrder?.attemptId ?? null) !== fence.attemptId) return;
+        if ((currentOrder?.revision ?? 0) !== fence.revision) return;
+        if (current.status !== "running") return;
+        this.applyAttemptInterruption(current);
+        this.bumpRankedRevision(current);
+        this.saveSessionRow(current, null, Number(currentRow.assigned_background_index));
+      });
+    }
+
+    const currentRow = this.getActiveRankedSessionRow(walletAddress);
+    if (!currentRow) return null;
+    return this.rowToSession(currentRow);
   }
 
   claimRankedEgg(walletAddress: string, body: Record<string, unknown>): LedSession {
     this.assertNoClientAuthoritativeFields(body);
+    parseRankedOrderCommand(body);
     const familyIndex = resolveFamilyIndexFromInput(body);
     const lampPosition = resolveLampPositionFromInput(body, -70);
 
@@ -2150,6 +2397,7 @@ export class HatcheryBackend {
       policy: this.policy,
     });
     session.lampPosition = lampPosition;
+    session.intentOrder = { ...freshRankedIntentOrder(`att-${randomUUID()}`), revision: 1 };
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -2212,51 +2460,46 @@ export class HatcheryBackend {
     body: Record<string, unknown>,
   ): Promise<{ session: LedSession; telemetry: HardwareTelemetrySnapshot }> {
     this.assertNoClientAuthoritativeFields(body);
+    const command = parseRankedOrderCommand(body);
+    const fence = this.captureRankedFence(walletAddress, body.sessionId, command);
     let telemetry: HardwareTelemetrySnapshot;
     try {
       telemetry = await this.getHardwareTelemetry();
     } catch (err) {
-      this.pauseRunningSessionForWalletOnTelemetryFailure(walletAddress, body.sessionId);
+      this.resetRankedAttemptIfUnchanged(walletAddress, body.sessionId, fence);
       throw err;
     }
     const nowMs = this.now();
     const nowIso = new Date(nowMs).toISOString();
 
-    let session!: LedSession;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    const session = this.withImmediateTransaction(() => {
       const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
       const sessionPolicy = this.resolvePolicyForSessionRow(row);
-      session = this.rowToSession(row);
-      if (session.status !== "running") {
-        this.releaseUnfinishedHoardedLocks(session);
+      const next = this.rowToSession(row);
+      const existing = readRankedIntentOrder(next.intentOrder);
+      if (rankedAttemptIsStale(existing, command)) {
+        throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+      }
+      const before = existing ? { ...existing } : null;
+      if (next.status !== "running") {
+        this.releaseUnfinishedHoardedLocks(next);
       }
 
-      if (session.status === "running") {
+      if (next.status === "running") {
         // Accrue preceding step using the previously aimed lampPosition BEFORE applying any new aim (R4).
         // A heartbeat gap clears the attempt; Start is then a new first light, never a lockless run.
-        const stepped = this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
-        if (stepped.autoPaused || session.status !== "running" || session.lockedTraits === null) {
-          this.relockFreshFirstLight(session, telemetry, sessionPolicy, nowIso);
+        const stepped = this.advanceRunningSessionStep(row, next, sessionPolicy, nowMs, telemetry);
+        if (stepped.autoPaused || next.status !== "running" || next.lockedTraits === null) {
+          this.relockFreshFirstLight(next, telemetry, sessionPolicy, nowIso);
         }
       } else {
-        this.relockFreshFirstLight(session, telemetry, sessionPolicy, nowIso);
+        this.relockFreshFirstLight(next, telemetry, sessionPolicy, nowIso);
       }
 
-      if (body.lampPosition !== undefined || body.activeRegion !== undefined) {
-        session.lampPosition = resolveLampPositionFromInput(body, session.lampPosition);
-      }
-
-      this.saveSessionRow(session, nowMs, Number(row.assigned_background_index));
-      this.db.exec("COMMIT");
-    } catch (err) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // ignore
-      }
-      throw err;
-    }
+      this.finishRankedLamp(next, command, body, before);
+      this.saveSessionRow(next, nowMs, Number(row.assigned_background_index));
+      return next;
+    });
 
     return { session, telemetry };
   }
@@ -2269,35 +2512,41 @@ export class HatcheryBackend {
     levelUps: { region: 0 | 1 | 2; previousLevel: number; newLevel: number }[];
   }> {
     this.assertNoClientAuthoritativeFields(body);
+    const command = parseRankedOrderCommand(body);
     if (body.lampPosition === undefined && body.activeRegion === undefined) {
       throw new HttpError(400, "lampPosition or activeRegion is required.");
     }
+    const fence = this.captureRankedFence(walletAddress, body.sessionId, command);
     let telemetry: HardwareTelemetrySnapshot;
     try {
       telemetry = await this.getHardwareTelemetry();
     } catch (err) {
-      this.pauseRunningSessionForWalletOnTelemetryFailure(walletAddress, body.sessionId);
+      this.resetRankedAttemptIfUnchanged(walletAddress, body.sessionId, fence);
       throw err;
     }
     const nowMs = this.now();
 
-    const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
-    const sessionPolicy = this.resolvePolicyForSessionRow(row);
-    const session = this.rowToSession(row);
-    let levelUps: { region: 0 | 1 | 2; previousLevel: number; newLevel: number }[] = [];
-
-    if (session.status === "running") {
-      const stepped = this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
-      levelUps = stepped.levelUps;
-    }
-
-    session.lampPosition = resolveLampPositionFromInput(body, session.lampPosition);
-    this.saveSessionRow(
-      session,
-      session.status === "running" ? nowMs : null,
-      Number(row.assigned_background_index),
-    );
-    return { session, levelUps };
+    return this.withImmediateTransaction(() => {
+      const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
+      const sessionPolicy = this.resolvePolicyForSessionRow(row);
+      const session = this.rowToSession(row);
+      const { levelUps } = this.applyRankedProgress({
+        row,
+        session,
+        sessionPolicy,
+        nowMs,
+        telemetry,
+        command,
+        body,
+        accrue: true,
+      });
+      this.saveSessionRow(
+        session,
+        session.status === "running" ? nowMs : null,
+        Number(row.assigned_background_index),
+      );
+      return { session, levelUps };
+    });
   }
 
   async pauseRankedSession(
@@ -2305,45 +2554,64 @@ export class HatcheryBackend {
     body: Record<string, unknown>,
   ): Promise<{ session: LedSession }> {
     this.assertNoClientAuthoritativeFields(body);
+    const command = parseRankedOrderCommand(body);
     const nowMs = this.now();
+    let previewRunning = false;
+    try {
+      previewRunning =
+        this.rowToSession(this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId)).status ===
+        "running";
+    } catch {
+      previewRunning = false;
+    }
+    let telemetry: HardwareTelemetrySnapshot | null = null;
+    if (previewRunning) {
+      try {
+        telemetry = await this.getHardwareTelemetry();
+      } catch {
+        telemetry = null;
+      }
+    }
 
-    const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
-    const sessionPolicy = this.resolvePolicyForSessionRow(row);
-    const session = this.rowToSession(row);
+    return this.withImmediateTransaction(() => {
+      const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
+      const sessionPolicy = this.resolvePolicyForSessionRow(row);
+      const session = this.rowToSession(row);
+      if (rankedAttemptIsStale(readRankedIntentOrder(session.intentOrder), command)) {
+        throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+      }
 
-    // Current rules: pause route must not preserve a running attempt for rare-trait farming.
-    if (!this.policy.allowsManualPause) {
-      if (session.status === "completed") {
-        throw new HttpError(409, "Completed sessions cannot be paused or reset.");
+      // Current rules: pause route must not preserve a running attempt for rare-trait farming.
+      if (!this.policy.allowsManualPause) {
+        if (session.status === "completed") {
+          throw new HttpError(409, "Completed sessions cannot be paused or reset.");
+        }
+        if (session.status === "running" && telemetry) {
+          this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
+        }
+        if (session.status !== "egg") this.clearRankedAttempt(session);
+        this.bumpRankedRevision(session);
+        this.saveSessionRow(session, null, Number(row.assigned_background_index));
+        return { session };
+      }
+
+      if (session.status === "running" && telemetry) {
+        this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
       }
       if (session.status === "running") {
-        try {
-          const telemetry = await this.getHardwareTelemetry();
-          this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
-        } catch {
-          // Do not accrue an invalid interval before clearing.
-        }
+        session.status = "paused";
+        session.completedAt = null;
+        session.backgroundIndex = null;
+        session.backgroundId = null;
+        session.intentOrder = rotateRankedIntentOrder(
+          readRankedIntentOrder(session.intentOrder),
+          `att-${randomUUID()}`,
+        );
       }
-      clearAttemptProgressKeepingEgg(session);
+      this.bumpRankedRevision(session);
       this.saveSessionRow(session, null, Number(row.assigned_background_index));
       return { session };
-    }
-
-    if (session.status === "running") {
-      try {
-        const telemetry = await this.getHardwareTelemetry();
-        this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
-      } catch {
-        // If telemetry is stale or offline when pausing, do not accrue the invalid interval
-      }
-      session.status = "paused";
-      session.completedAt = null;
-      session.backgroundIndex = null;
-      session.backgroundId = null;
-    }
-
-    this.saveSessionRow(session, null, Number(row.assigned_background_index));
-    return { session };
+    });
   }
 
   async tickRankedSession(
@@ -2356,37 +2624,39 @@ export class HatcheryBackend {
     telemetry: HardwareTelemetrySnapshot;
   }> {
     this.assertNoClientAuthoritativeFields(body);
+    const command = parseRankedOrderCommand(body);
+    const fence = this.captureRankedFence(walletAddress, body.sessionId, command);
     let telemetry: HardwareTelemetrySnapshot;
     try {
       telemetry = await this.getHardwareTelemetry();
     } catch (err) {
-      this.pauseRunningSessionForWalletOnTelemetryFailure(walletAddress, body.sessionId);
+      this.resetRankedAttemptIfUnchanged(walletAddress, body.sessionId, fence);
       throw err;
     }
     const nowMs = this.now();
 
-    const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
-    const sessionPolicy = this.resolvePolicyForSessionRow(row);
-    const session = this.rowToSession(row);
-
-    let levelUps: { region: 0 | 1 | 2; previousLevel: number; newLevel: number }[] = [];
-    if (session.status === "running") {
-      // Accrue preceding step to old lampPosition BEFORE updating lampPosition (R4)
-      const stepped = this.advanceRunningSessionStep(row, session, sessionPolicy, nowMs, telemetry);
-      levelUps = stepped.levelUps;
-    }
-
-    if (body.lampPosition !== undefined || body.activeRegion !== undefined) {
-      session.lampPosition = resolveLampPositionFromInput(body, session.lampPosition);
-    }
-
-    const readyToComplete = session.elapsed + 1e-6 >= sessionPolicy.durationSeconds;
-    this.saveSessionRow(
-      session,
-      session.status === "running" ? nowMs : null,
-      Number(row.assigned_background_index),
-    );
-    return { session, levelUps, readyToComplete, telemetry };
+    return this.withImmediateTransaction(() => {
+      const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
+      const sessionPolicy = this.resolvePolicyForSessionRow(row);
+      const session = this.rowToSession(row);
+      const { levelUps } = this.applyRankedProgress({
+        row,
+        session,
+        sessionPolicy,
+        nowMs,
+        telemetry,
+        command,
+        body,
+        accrue: true,
+      });
+      const readyToComplete = session.elapsed + 1e-6 >= sessionPolicy.durationSeconds;
+      this.saveSessionRow(
+        session,
+        session.status === "running" ? nowMs : null,
+        Number(row.assigned_background_index),
+      );
+      return { session, levelUps, readyToComplete, telemetry };
+    });
   }
 
   abandonRankedSession(
@@ -2394,12 +2664,19 @@ export class HatcheryBackend {
     body: Record<string, unknown>,
   ): { abandonedSessionId: string } {
     this.assertNoClientAuthoritativeFields(body);
-    const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
-    const sessionId = String(row.session_id);
-    this.db
-      .prepare(`UPDATE ranked_sessions SET status = 'abandoned' WHERE session_id = ?`)
-      .run(sessionId);
-    return { abandonedSessionId: sessionId };
+    const command = parseRankedOrderCommand(body);
+    return this.withImmediateTransaction(() => {
+      const row = this.resolveOwnedActiveSessionRow(walletAddress, body.sessionId);
+      const session = this.rowToSession(row);
+      if (rankedAttemptIsStale(readRankedIntentOrder(session.intentOrder), command)) {
+        throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+      }
+      const sessionId = String(row.session_id);
+      this.db
+        .prepare(`UPDATE ranked_sessions SET status = 'abandoned' WHERE session_id = ?`)
+        .run(sessionId);
+      return { abandonedSessionId: sessionId };
+    });
   }
 
   private buildCurrentResultResponseFromRow(
@@ -2449,6 +2726,7 @@ export class HatcheryBackend {
     allowance?: DailyAllowanceDto;
   }> {
     this.assertNoClientAuthoritativeFields(body);
+    const command = parseRankedOrderCommand(body);
     const checksumAddress = getAddress(walletAddress);
     const walletKey = checksumAddress.toLowerCase();
 
@@ -2498,16 +2776,14 @@ export class HatcheryBackend {
     }
 
     const preSessionPolicy = this.resolvePolicyForSessionRow(preRow);
+    const fence = this.captureRankedFence(walletAddress, String(preRow.session_id), command);
 
     let telemetry: HardwareTelemetrySnapshot | null = null;
     if (String(preRow.status) === "running") {
       try {
         telemetry = await this.getHardwareTelemetry();
       } catch (err) {
-        this.pauseRunningSessionForWalletOnTelemetryFailure(
-          walletAddress,
-          String(preRow.session_id),
-        );
+        this.resetRankedAttemptIfUnchanged(walletAddress, String(preRow.session_id), fence);
         throw err;
       }
     }
@@ -2541,6 +2817,9 @@ export class HatcheryBackend {
 
       const sessionPolicy = this.resolvePolicyForSessionRow(sessionRow) ?? preSessionPolicy;
       const session = this.rowToSession(sessionRow);
+      if (rankedAttemptIsStale(readRankedIntentOrder(session.intentOrder), command)) {
+        throw new HttpError(409, STALE_RANKED_INTENT_ERROR);
+      }
       if (!session.lockedTraits) {
         throw new HttpError(
           400,
@@ -2554,6 +2833,7 @@ export class HatcheryBackend {
 
       // R2 + R12: Ranked session must complete the full durationSeconds of its original immutable policy
       if (session.elapsed + 1e-6 < sessionPolicy.durationSeconds) {
+        this.bumpRankedRevision(session);
         this.saveSessionRow(
           session,
           session.status === "running" ? nowMs : null,
@@ -2572,6 +2852,7 @@ export class HatcheryBackend {
       session.completedAt = nowIso;
       session.backgroundIndex = assignedBg.index;
       session.backgroundId = assignedBg.id;
+      this.bumpRankedRevision(session);
 
       this.saveSessionRow(session, nowMs, assignedBg.index);
 

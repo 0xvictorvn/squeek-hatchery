@@ -749,6 +749,8 @@ export class LedPortraitAdapter {
   private _backDetailCopy: HTMLCanvasElement | null = null;
   private _wearLayer: HTMLCanvasElement | null = null;
   private _wearLight: WearLightCache | null = null;
+  private _wearBase: HTMLCanvasElement | null = null;
+  private _wearCanAnimate = false;
   private _wearAnimation = 0;
   private _wearPoseCache = new Map<string, WearPose>();
   private _groundCache = new Map<string, HTMLCanvasElement>();
@@ -2590,68 +2592,53 @@ export class LedPortraitAdapter {
     g.restore();
   }
 
-  private _illuminate(state: LedRenderState, staticOnly = false): void {
-    this.stopAnimation();
+  private _paintWearFrame(time: number): void {
     const light = this._wearLight;
-    if (state.accessory < 7 || !light) return;
-    const base = document.createElement("canvas");
-    base.width = this.canvas.width;
-    base.height = this.canvas.height;
-    base.getContext("2d")!.drawImage(this.canvas, 0, 0);
-
-    const paint = (time: number) => {
-      if (this._disposed) return;
-      const g = this.ctx;
-      const pulse = 0.82 + 0.18 * Math.sin(time / 1450);
-      g.save();
-      g.clearRect(LED_FRAME.x, LED_FRAME.y, LED_FRAME.width, LED_FRAME.height);
-      g.drawImage(
-        base,
-        LED_FRAME.x,
-        LED_FRAME.y,
-        LED_FRAME.width,
-        LED_FRAME.height,
-      );
-      g.globalCompositeOperation = "screen";
-      g.globalAlpha = pulse;
-      g.drawImage(light.halo, 0, 0);
-      g.globalAlpha = 0.78 + 0.2 * pulse;
-      g.drawImage(light.led, 0, 0);
-      for (let i = 0; i < light.points.length; i++) {
-        const [px, py, color] = light.points[i];
-        const twinkle = Math.max(0, Math.sin(time / 820 - i * 1.7)) ** 8;
-        if (twinkle < 0.03) continue;
-        const x = 17 + Math.round((px - 17) / 6) * 6;
-        const y = 9 + Math.round((py - 9) / 6) * 6;
-        g.globalAlpha = 0.9 * twinkle;
-        g.fillStyle = color;
-        g.shadowColor = color;
-        g.shadowBlur = 12;
-        for (const [dx, dy, r] of [
-          [0, 0, 2.6],
-          [-6, 0, 1.7],
-          [6, 0, 1.7],
-          [0, -6, 1.7],
-          [0, 6, 1.7],
-        ]) {
-          g.beginPath();
-          g.arc(x + dx, y + dy, r, 0, Math.PI * 2);
-          g.fill();
-        }
+    const base = this._wearBase;
+    if (this._disposed || !light || !base) return;
+    const g = this.ctx;
+    const pulse = 0.82 + 0.18 * Math.sin(time / 1450);
+    g.save();
+    g.clearRect(LED_FRAME.x, LED_FRAME.y, LED_FRAME.width, LED_FRAME.height);
+    g.drawImage(
+      base,
+      LED_FRAME.x,
+      LED_FRAME.y,
+      LED_FRAME.width,
+      LED_FRAME.height,
+    );
+    g.globalCompositeOperation = "screen";
+    g.globalAlpha = pulse;
+    g.drawImage(light.halo, 0, 0);
+    g.globalAlpha = 0.78 + 0.2 * pulse;
+    g.drawImage(light.led, 0, 0);
+    for (let i = 0; i < light.points.length; i++) {
+      const [px, py, color] = light.points[i];
+      const twinkle = Math.max(0, Math.sin(time / 820 - i * 1.7)) ** 8;
+      if (twinkle < 0.03) continue;
+      const x = 17 + Math.round((px - 17) / 6) * 6;
+      const y = 9 + Math.round((py - 9) / 6) * 6;
+      g.globalAlpha = 0.9 * twinkle;
+      g.fillStyle = color;
+      g.shadowColor = color;
+      g.shadowBlur = 12;
+      for (const [dx, dy, r] of [
+        [0, 0, 2.6],
+        [-6, 0, 1.7],
+        [6, 0, 1.7],
+        [0, -6, 1.7],
+        [0, 6, 1.7],
+      ]) {
+        g.beginPath();
+        g.arc(x + dx, y + dy, r, 0, Math.PI * 2);
+        g.fill();
       }
-      g.shadowBlur = 0;
-      g.restore();
-    };
-
-    paint(1100);
-    if (
-      staticOnly ||
-      this._disposed ||
-      (typeof window !== "undefined" &&
-        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches)
-    ) {
-      return;
     }
+    g.shadowBlur = 0;
+    g.restore();
+  }
+
+  private _startWearLoop(): void {
     let last = 0;
     const tick = (time: number) => {
       if (this._disposed) {
@@ -2662,12 +2649,35 @@ export class LedPortraitAdapter {
         (typeof document === "undefined" || !document.hidden) &&
         time - last >= 40
       ) {
-        paint(time);
+        this._paintWearFrame(time);
         last = time;
       }
       this._wearAnimation = requestAnimationFrame(tick);
     };
     this._wearAnimation = requestAnimationFrame(tick);
+  }
+
+  private _illuminate(state: LedRenderState, staticOnly = false): void {
+    this.stopAnimation();
+    this._wearCanAnimate = false;
+    const light = this._wearLight;
+    if (state.accessory < 7 || !light) {
+      this._wearBase = null;
+      return;
+    }
+    if (!this._wearBase) this._wearBase = document.createElement("canvas");
+    const base = this._wearBase;
+    base.width = this.canvas.width;
+    base.height = this.canvas.height;
+    base.getContext("2d")!.drawImage(this.canvas, 0, 0);
+    const reduce =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    this._paintWearFrame(1100);
+    if (this._disposed || reduce) return;
+    this._wearCanAnimate = true;
+    if (staticOnly) return;
+    this._startWearLoop();
   }
 
   private _paintLedDots(state: LedRenderState, staticOnly = false): void {
@@ -3005,6 +3015,24 @@ export class LedPortraitAdapter {
     return out.toDataURL("image/png");
   }
 
+  /**
+   * Continue an accessory loop from the stored portrait.
+   * Does not rebuild the character.
+   */
+  resumeAccessoryAnimation(): boolean {
+    if (this._disposed || !this._wearCanAnimate || !this._wearLight || !this._wearBase) return false;
+    if (
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return false;
+    }
+    if (this._wearAnimation) return true;
+    this._paintWearFrame(1100);
+    this._startWearLoop();
+    return true;
+  }
+
   stopAnimation(): void {
     if (this._wearAnimation) {
       cancelAnimationFrame(this._wearAnimation);
@@ -3017,6 +3045,8 @@ export class LedPortraitAdapter {
     this._disposed = true;
     this._renderGen++;
     this._wearLight = null;
+    this._wearBase = null;
+    this._wearCanAnimate = false;
     this._wearLayer = null;
     this._backBodyCopy = null;
     this._backDetailCopy = null;
